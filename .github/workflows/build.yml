@@ -16,65 +16,152 @@ jobs:
           git clone --depth 1 https://github.com/JDKaintscared/BlackBox.git src
           cd src && git log -1 --oneline
 
-      - name: Apply hardening + logging
+      - name: Apply instrumentation
         run: |
-          cp hardening/harden.cpp src/Bcore/src/main/cpp/harden.cpp
-          cp hardening/OfxLog.kt src/app/src/main/java/top/niunaijun/blackboxa/app/OfxLog.kt
+          cp hardening/OfxLog.java src/Bcore/src/main/java/top/niunaijun/blackbox/util/OfxLog.java
           python3 - <<'PY'
           import sys, pathlib
 
-          # --- native hooks into the Bcore module -------------------------
-          mk = pathlib.Path("src/Bcore/src/main/cpp/Android.mk")
-          s = mk.read_text()
-          if "harden.cpp" not in s:
-              old = "LOCAL_SRC_FILES := BoxCore.cpp \\"
+          def rd(p):
+              return pathlib.Path(p).read_text()
+
+          def wr(p, s):
+              pathlib.Path(p).write_text(s)
+
+          def sub(s, old, new, tag):
               if old not in s:
-                  sys.exit("Android.mk: anchor not found")
-              s = s.replace(old, "LOCAL_SRC_FILES := BoxCore.cpp \\\n    harden.cpp \\")
-              mk.write_text(s)
+                  sys.exit("anchor not found: " + tag)
+              return s.replace(old, new, 1)
 
-          bc = pathlib.Path("src/Bcore/src/main/cpp/BoxCore.cpp")
-          s = bc.read_text()
-          if "ofx_install_hardening" not in s:
-              anchor = "void registerMethod(JNIEnv *jenv) {"
-              if anchor not in s:
-                  sys.exit("BoxCore.cpp: anchor not found")
-              s = s.replace(anchor, 'extern "C" void ofx_install_hardening();\n\n' + anchor)
-              call = "    registerMethod(env);\n    return JNI_VERSION_1_6;"
-              if call not in s:
-                  sys.exit("BoxCore.cpp: JNI_OnLoad anchor not found")
-              s = s.replace(call, "    registerMethod(env);\n    ofx_install_hardening();\n    return JNI_VERSION_1_6;")
-              bc.write_text(s)
+          # ---------- Bcore logger ----------
+          # (copied above)
 
-          # --- boot logging ----------------------------------------------
-          app = pathlib.Path("src/app/src/main/java/top/niunaijun/blackboxa/app/App.kt")
-          s = app.read_text()
-          if "OfxLog.install" not in s:
-              anchor = "            super.attachBaseContext(base)"
-              if anchor not in s:
-                  sys.exit("App.kt: attachBaseContext anchor not found")
-              s = s.replace(anchor, anchor + "\n            OfxLog.install(this)", 1)
-              app.write_text(s)
-
-          wc = pathlib.Path("src/app/src/main/java/top/niunaijun/blackboxa/view/main/WelcomeActivity.kt")
-          s = wc.read_text()
+          # ---------- LauncherActivity: launch chain ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/LauncherActivity.java"
+          s = rd(p)
           if "OfxLog" not in s:
-              if "import android.os.Bundle" not in s:
-                  sys.exit("WelcomeActivity: import anchor not found")
-              s = s.replace("import android.os.Bundle",
-                            "import android.os.Bundle\nimport top.niunaijun.blackboxa.app.OfxLog", 1)
-              anchor = "        super.onCreate(savedInstanceState)"
-              if anchor not in s:
-                  sys.exit("WelcomeActivity: onCreate anchor not found")
-              s = s.replace(anchor, anchor + '\n        OfxLog.log("WelcomeActivity.onCreate")', 1)
-              wc.write_text(s)
+              s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
+                      "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "LauncherActivity import")
+              s = sub(s, 'Slog.d(TAG, "Starting app launch in background thread");',
+                      'Slog.d(TAG, "Starting app launch in background thread");\n'
+                      '                OfxLog.log("launchAppAsync begin pkg=" + launchIntent.getPackage()'
+                      ' + " cmp=" + launchIntent.getComponent());',
+                      "LaunchActivity begin")
+              s = sub(s, 'Slog.d(TAG, "App launch initiated successfully");',
+                      'Slog.d(TAG, "App launch initiated successfully");\n'
+                      '                OfxLog.log("launchAppAsync startActivity returned");',
+                      "LaunchActivity ok")
+              s = sub(s, 'Slog.e(TAG, "Error launching app", e);',
+                      'Slog.e(TAG, "Error launching app", e);\n'
+                      '                OfxLog.log("LAUNCH FAILED " + e);\n'
+                      '                OfxLog.log(android.util.Log.getStackTraceString(e));',
+                      "LaunchActivity catch")
+              wr(p, s)
 
-          print("patched ok:",
-                "harden.cpp" in mk.read_text(),
-                "ofx_install_hardening" in bc.read_text(),
-                "OfxLog.install" in app.read_text(),
-                "OfxLog" in wc.read_text())
+          # ---------- ActivityStack: guest process creation ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/am/ActivityStack.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
+                      "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "ActivityStack import")
+              s = sub(s, "ProcessRecord targetApp = BProcessManagerService.get().startProcessLocked(info.packageName, info.processName, userId, -1, Binder.getCallingPid());",
+                      'OfxLog.log("startActivityProcess pkg=" + info.packageName + " proc=" + info.processName);\n'
+                      "        ProcessRecord targetApp = BProcessManagerService.get().startProcessLocked(info.packageName, info.processName, userId, -1, Binder.getCallingPid());\n"
+                      '        OfxLog.log("startActivityProcess -> " + (targetApp != null));',
+                      "ActivityStack startActivityProcess")
+              wr(p, s)
+
+          # ---------- BProcessManagerService: spawn + provider handshake ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/BProcessManagerService.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
+                      "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "BProcessManager import")
+              s = sub(s, "        ApplicationInfo info = BPackageManagerService.get().getApplicationInfo(packageName, 0, userId);",
+                      '        OfxLog.log("startProcessLocked pkg=" + packageName + " proc=" + processName + " user=" + userId);\n'
+                      "        ApplicationInfo info = BPackageManagerService.get().getApplicationInfo(packageName, 0, userId);",
+                      "startProcessLocked entry")
+              s = sub(s, "            if (!initAppProcessL(app)) {",
+                      "            boolean inited;\n"
+                      "            try {\n"
+                      "                inited = initAppProcessL(app);\n"
+                      "            } catch (Throwable t) {\n"
+                      '                OfxLog.log("initAppProcessL threw " + t);\n'
+                      "                OfxLog.log(android.util.Log.getStackTraceString(t));\n"
+                      "                inited = false;\n"
+                      "            }\n"
+                      '            OfxLog.log("initAppProcessL -> " + inited);\n'
+                      "            if (!inited) {",
+                      "initAppProcessL guard")
+              s = sub(s, '        Bundle init = ProviderCall.callSafely(record.getProviderAuthority(), "_Black_|_init_process_", null, bundle);',
+                      '        OfxLog.log("provider call " + record.getProviderAuthority());\n'
+                      '        Bundle init = ProviderCall.callSafely(record.getProviderAuthority(), "_Black_|_init_process_", null, bundle);\n'
+                      '        OfxLog.log("provider call -> " + (init != null));',
+                      "provider call")
+              wr(p, s)
+
+          # ---------- ProxyContentProvider: proof the guest process exists ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/proxy/ProxyContentProvider.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "    public boolean onCreate() {",
+                      '    public boolean onCreate() {\n'
+                      '        top.niunaijun.blackbox.util.OfxLog.log("guest provider onCreate");',
+                      "provider onCreate")
+              s = sub(s, "    public Bundle call(@NonNull String method, @Nullable String arg, @Nullable Bundle extras) {",
+                      "    public Bundle call(@NonNull String method, @Nullable String arg, @Nullable Bundle extras) {\n"
+                      '        top.niunaijun.blackbox.util.OfxLog.log("guest provider call " + method);',
+                      "provider call")
+              wr(p, s)
+
+          # ---------- BActivityThread: guest-side boot ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
+                      "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "BActivityThread import")
+              s = sub(s, "    public void bindApplication(final String packageName, final String processName) {",
+                      "    public void bindApplication(final String packageName, final String processName) {\n"
+                      '        OfxLog.log("bindApplication " + packageName + "/" + processName);',
+                      "bindApplication")
+              wr(p, s)
+
+          # ---------- Host app: install logger in every process ----------
+          p = "src/app/src/main/java/top/niunaijun/blackboxa/app/App.kt"
+          s = rd(p)
+          if "OfxLog.install" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.BlackBoxCore",
+                      "import top.niunaijun.blackbox.BlackBoxCore\nimport top.niunaijun.blackbox.util.OfxLog",
+                      "App.kt import")
+              s = sub(s, "            super.attachBaseContext(base)",
+                      "            super.attachBaseContext(base)\n            OfxLog.install(this)",
+                      "App.kt install")
+              wr(p, s)
+
+          p = "src/app/src/main/java/top/niunaijun/blackboxa/view/main/WelcomeActivity.kt"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import android.os.Bundle",
+                      "import android.os.Bundle\nimport top.niunaijun.blackbox.util.OfxLog",
+                      "Welcome import")
+              s = sub(s, "        super.onCreate(savedInstanceState)",
+                      '        super.onCreate(savedInstanceState)\n        OfxLog.log("WelcomeActivity.onCreate")',
+                      "Welcome log")
+              wr(p, s)
+
+          print("patched ok")
           PY
+          grep -c "OfxLog" \
+            src/Bcore/src/main/java/top/niunaijun/blackbox/app/LauncherActivity.java \
+            src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/BProcessManagerService.java \
+            src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/am/ActivityStack.java \
+            src/Bcore/src/main/java/top/niunaijun/blackbox/proxy/ProxyContentProvider.java \
+            src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java \
+            src/app/src/main/java/top/niunaijun/blackboxa/app/App.kt
 
       - uses: actions/setup-java@v4
         with:
