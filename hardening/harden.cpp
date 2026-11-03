@@ -10,6 +10,15 @@
 //    8  /proc/self/maps      -> container paths rewritten, our libs dropped
 //   16  root marker paths    -> ENOENT
 //   64  install NO hooks at all (bisect: is the hook layer itself the problem?)
+// Hook-select (bisect one hook group at a time, masks off):
+//   If ANY of 128..2048 is set, ONLY those groups are installed.
+//   If none is set, all hooks are installed (old behaviour: 0, 31, ...).
+//  128  PROP group: __system_property_get, __system_property_find
+//  256  OPEN group: open, openat, fopen, __open_2, __openat_2
+//  512  STAT group: stat, lstat, access
+// 1024  MISC group: uname, execve, readlink
+// 2048  DL group: dl_iterate_phdr
+// Examples (masks off, trampoline only): 128, 256, 512, 1024, 2048
 //
 // Everything is written straight into the append-mode fd the Java side hands
 // over, so a native crash cannot swallow the trace. A SIGSEGV handler logs the
@@ -59,7 +68,13 @@ enum {
     M_MAPS      = 8,
     M_ROOTPATHS = 16,
     M_NOHOOKS   = 64,
+    H_PROP      = 128,
+    H_OPEN      = 256,
+    H_STAT      = 512,
+    H_MISC      = 1024,
+    H_DL        = 2048,
 };
+
 
 std::atomic<bool> g_installed{false};
 std::atomic<int>  g_budget{30000};
@@ -72,6 +87,12 @@ std::mutex g_mtx;
 std::string g_buf;
 
 bool modeOn(int bit) { return (g_mode & bit) != 0; }
+
+bool hookOn(int group) {
+    const int any = H_PROP | H_OPEN | H_STAT | H_MISC | H_DL;
+    if ((g_mode & any) == 0) return true;  // no selection: old behaviour, all hooks
+    return (g_mode & group) != 0;
+}
 
 const char* guestPkg() {
     return g_pkg[0] ? g_pkg : "android";
@@ -662,34 +683,66 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
 
     logSymbols();
 
-    patch("__system_property_get",  (void*)hookPropGet,  (void**)&origPropGet,  "propget");
-    patch("__system_property_find", (void*)hookPropFind, (void**)&origPropFind, "propfind");
-    patch("open",                   (void*)hookOpen,     (void**)&origOpen,     "open");
-    patch("openat",                 (void*)hookOpenat,   (void**)&origOpenat,   "openat");
-    patch("fopen",                  (void*)hookFopen,    (void**)&origFopen,    "fopen");
-    patch("stat",                   (void*)hookStat,     (void**)&origStat,     "stat");
-    patch("lstat",                  (void*)hookLstat,    (void**)&origLstat,    "lstat");
-    patch("access",                 (void*)hookAccess,   (void**)&origAccess,   "access");
-    patch("uname",                  (void*)hookUname,    (void**)&origUname,    "uname");
-    patch("execve",                 (void*)hookExecve,   (void**)&origExecve,   "execve");
-    patch("readlink",               (void*)hookReadlink, (void**)&origReadlink, "readlink");
-    patch("dl_iterate_phdr",        (void*)hookDlIterate, (void**)&origDlIterate, "dl_iterate_phdr");
+    {
+        char hb[128];
+        snprintf(hb, sizeof(hb), "mode=%d prop=%d open=%d stat=%d misc=%d dl=%d",
+                 g_mode, hookOn(H_PROP) ? 1 : 0, hookOn(H_OPEN) ? 1 : 0,
+                 hookOn(H_STAT) ? 1 : 0, hookOn(H_MISC) ? 1 : 0, hookOn(H_DL) ? 1 : 0);
+        nlogRaw("hooksel", hb);
+    }
+
+    if (hookOn(H_PROP)) {
+        patch("__system_property_get",  (void*)hookPropGet,  (void**)&origPropGet,  "propget");
+        patch("__system_property_find", (void*)hookPropFind, (void**)&origPropFind, "propfind");
+    } else {
+        nlogRaw("skip", "prop group");
+    }
+    if (hookOn(H_OPEN)) {
+        patch("open",                   (void*)hookOpen,     (void**)&origOpen,     "open");
+        patch("openat",                 (void*)hookOpenat,   (void**)&origOpenat,   "openat");
+        patch("fopen",                  (void*)hookFopen,    (void**)&origFopen,    "fopen");
+    } else {
+        nlogRaw("skip", "open group");
+    }
+    if (hookOn(H_STAT)) {
+        patch("stat",                   (void*)hookStat,     (void**)&origStat,     "stat");
+        patch("lstat",                  (void*)hookLstat,    (void**)&origLstat,    "lstat");
+        patch("access",                 (void*)hookAccess,   (void**)&origAccess,   "access");
+    } else {
+        nlogRaw("skip", "stat group");
+    }
+    if (hookOn(H_MISC)) {
+        patch("uname",                  (void*)hookUname,    (void**)&origUname,    "uname");
+        patch("execve",                 (void*)hookExecve,   (void**)&origExecve,   "execve");
+        patch("readlink",               (void*)hookReadlink, (void**)&origReadlink, "readlink");
+    } else {
+        nlogRaw("skip", "misc group");
+    }
+    if (hookOn(H_DL)) {
+        patch("dl_iterate_phdr",        (void*)hookDlIterate, (void**)&origDlIterate, "dl_iterate_phdr");
+    } else {
+        nlogRaw("skip", "dl group");
+    }
 
     // FORTIFY wrappers: only patch when they are distinct symbols, otherwise the
     // two trampolines call each other and the guest dies of stack overflow.
-    void* o = sym("open");
-    void* o2 = sym("__open_2");
-    if (o2 && o2 != o) {
-        patch("__open_2", (void*)hookOpen2, (void**)&origOpen2, "open2");
+    if (hookOn(H_OPEN)) {
+        void* o = sym("open");
+        void* o2 = sym("__open_2");
+        if (o2 && o2 != o) {
+            patch("__open_2", (void*)hookOpen2, (void**)&origOpen2, "open2");
+        } else {
+            nlogRaw("skip", "__open_2 aliases open");
+        }
+        void* oa = sym("openat");
+        void* oa2 = sym("__openat_2");
+        if (oa2 && oa2 != oa) {
+            patch("__openat_2", (void*)hookOpenat2, (void**)&origOpenat2, "openat2");
+        } else {
+            nlogRaw("skip", "__openat_2 aliases openat");
+        }
     } else {
-        nlogRaw("skip", "__open_2 aliases open");
-    }
-    void* oa = sym("openat");
-    void* oa2 = sym("__openat_2");
-    if (oa2 && oa2 != oa) {
-        patch("__openat_2", (void*)hookOpenat2, (void**)&origOpenat2, "openat2");
-    } else {
-        nlogRaw("skip", "__openat_2 aliases openat");
+        nlogRaw("skip", "open2/openat2 group");
     }
 
     nlogRaw("done", "hooks installed");
