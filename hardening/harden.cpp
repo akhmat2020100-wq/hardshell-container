@@ -41,6 +41,10 @@
 
 #define HLOG(...) __android_log_print(ANDROID_LOG_INFO, "ofx-harden", __VA_ARGS__)
 
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
 namespace {
 
 std::atomic<bool> g_installed{false};
