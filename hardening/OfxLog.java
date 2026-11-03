@@ -212,6 +212,19 @@ public final class OfxLog {
             return;
         }
 
+        // After IOCore.enableRedirect, MediaStore re-opens and direct
+        // /sdcard paths can go to the virtual dir, so Java logs after
+        // redirect were lost from the host log file even though the code
+        // continued. The native fd (opened before redirect) still points
+        // at the host file, so write through it first when it exists.
+        try {
+            if (fd >= 0) {
+                top.niunaijun.blackbox.core.NativeCore.ofxWriteLog(line.trim());
+                return;
+            }
+        } catch (Throwable ignored) {
+        }
+
         if (Build.VERSION.SDK_INT >= 29) {
             try {
                 Uri u = uri;
