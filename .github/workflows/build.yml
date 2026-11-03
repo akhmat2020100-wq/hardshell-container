@@ -34,6 +34,14 @@ jobs:
                   sys.exit("anchor not found: " + tag)
               return s.replace(old, new, 1)
 
+          # ---------- release build: debuggable=false, no R8 surprises ----------
+          p = "src/app/build.gradle"
+          s = rd(p)
+          if "minifyEnabled false" not in s:
+              s = sub(s, "            minifyEnabled true", "            minifyEnabled false",
+                      "app build.gradle minify")
+              wr(p, s)
+
           # ---------- native lib: add harden.cpp to the build ----------
           p = "src/Bcore/src/main/cpp/Android.mk"
           s = rd(p)
@@ -208,11 +216,11 @@ jobs:
         working-directory: src
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: blackbox-apk
-          path: src/app/build/outputs/apk/debug/*.apk
+          path: src/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
