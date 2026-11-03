@@ -276,7 +276,12 @@ bool procTarget(const char* p) {
 // memfd
 // ---------------------------------------------------------------------------
 int memfdFor(const std::string& data) {
-    int fd = (int)syscall(SYS_memfd_create, "jit-cache", MFD_CLOEXEC);
+    // NOTE: was "jit-cache" — that string itself is in kMarks, so a raw-syscall
+    // maps read would flag our own scrubbed fd. Use the guest package instead.
+    std::string memName = guestPkg();
+    if (memName.size() > 15) memName.resize(15);
+    if (memName.empty()) memName = "android";
+    int fd = (int)syscall(SYS_memfd_create, memName.c_str(), MFD_CLOEXEC);
     if (fd < 0) return -1;
     size_t off = 0;
     while (off < data.size()) {
@@ -425,7 +430,35 @@ int hookPropGet(const char* key, char* out) {
 
 const void* hookPropFind(const char* key) {
     if (key) trace("find", key);
+    // Previously find() was trace-only: native code using find()+read()
+    // bypassed the propget mask entirely. Hide the same props here.
+    if (key && modeOn(M_PROPS)) {
+        for (const char* h : kHiddenProps) {
+            if (strcmp(key, h) == 0) return nullptr;
+        }
+    }
     return origPropFind ? origPropFind(key) : nullptr;
+}
+
+// dl_iterate_phdr bypasses /proc/self/maps completely: it lists every
+// loaded .so (libBoxCore, Dobby, BlackBox) straight from the linker.
+// Filter marked libraries out of the callback stream.
+typedef int (*dlIterateFn)(int (*)(struct dl_phdr_info*, size_t, void*), void*);
+dlIterateFn origDlIterate = nullptr;
+struct DlWrap {
+    int (*cb)(struct dl_phdr_info*, size_t, void*);
+    void* data;
+};
+int dlWrapCb(struct dl_phdr_info* info, size_t size, void* data) {
+    DlWrap* w = (DlWrap*)data;
+    if (info && info->dlpi_name && marked(info->dlpi_name)) return 0;
+    return w->cb(info, size, w->data);
+}
+int hookDlIterate(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) {
+    if (!cb) return origDlIterate ? origDlIterate(cb, data) : -1;
+    if (!modeOn(M_MAPS)) return origDlIterate ? origDlIterate(cb, data) : -1;
+    DlWrap w{cb, data};
+    return origDlIterate ? origDlIterate(dlWrapCb, &w) : -1;
 }
 
 int hookStat(const char* p, struct stat* b) {
@@ -623,6 +656,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     patch("uname",                  (void*)hookUname,    (void**)&origUname,    "uname");
     patch("execve",                 (void*)hookExecve,   (void**)&origExecve,   "execve");
     patch("readlink",               (void*)hookReadlink, (void**)&origReadlink, "readlink");
+    patch("dl_iterate_phdr",        (void*)hookDlIterate, (void**)&origDlIterate, "dl_iterate_phdr");
 
     // FORTIFY wrappers: only patch when they are distinct symbols, otherwise the
     // two trampolines call each other and the guest dies of stack overflow.
