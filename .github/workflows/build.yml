@@ -16,12 +16,14 @@ jobs:
           git clone --depth 1 https://github.com/JDKaintscared/BlackBox.git src
           cd src && git log -1 --oneline
 
-      - name: Apply hardening layer
+      - name: Apply hardening + logging
         run: |
           cp hardening/harden.cpp src/Bcore/src/main/cpp/harden.cpp
+          cp hardening/OfxLog.kt src/app/src/main/java/top/niunaijun/blackboxa/app/OfxLog.kt
           python3 - <<'PY'
           import sys, pathlib
 
+          # --- native hooks into the Bcore module -------------------------
           mk = pathlib.Path("src/Bcore/src/main/cpp/Android.mk")
           s = mk.read_text()
           if "harden.cpp" not in s:
@@ -44,7 +46,34 @@ jobs:
               s = s.replace(call, "    registerMethod(env);\n    ofx_install_hardening();\n    return JNI_VERSION_1_6;")
               bc.write_text(s)
 
-          print("patched:", "harden.cpp" in mk.read_text(), "ofx_install_hardening" in bc.read_text())
+          # --- boot logging ----------------------------------------------
+          app = pathlib.Path("src/app/src/main/java/top/niunaijun/blackboxa/app/App.kt")
+          s = app.read_text()
+          if "OfxLog.install" not in s:
+              anchor = "            super.attachBaseContext(base)"
+              if anchor not in s:
+                  sys.exit("App.kt: attachBaseContext anchor not found")
+              s = s.replace(anchor, anchor + "\n            OfxLog.install(this)", 1)
+              app.write_text(s)
+
+          wc = pathlib.Path("src/app/src/main/java/top/niunaijun/blackboxa/view/main/WelcomeActivity.kt")
+          s = wc.read_text()
+          if "OfxLog" not in s:
+              if "import android.os.Bundle" not in s:
+                  sys.exit("WelcomeActivity: import anchor not found")
+              s = s.replace("import android.os.Bundle",
+                            "import android.os.Bundle\nimport top.niunaijun.blackboxa.app.OfxLog", 1)
+              anchor = "        super.onCreate(savedInstanceState)"
+              if anchor not in s:
+                  sys.exit("WelcomeActivity: onCreate anchor not found")
+              s = s.replace(anchor, anchor + '\n        OfxLog.log("WelcomeActivity.onCreate")', 1)
+              wc.write_text(s)
+
+          print("patched ok:",
+                "harden.cpp" in mk.read_text(),
+                "ofx_install_hardening" in bc.read_text(),
+                "OfxLog.install" in app.read_text(),
+                "OfxLog" in wc.read_text())
           PY
 
       - uses: actions/setup-java@v4
