@@ -7,6 +7,7 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import android.provider.MediaStore;
 
@@ -33,6 +34,8 @@ public final class OfxLog {
     private static volatile Context ctx;
     private static volatile Uri uri;
     private static volatile boolean installed;
+    private static volatile int fd = -1;
+    private static volatile int cachedMode = -1;
 
     private OfxLog() {
     }
@@ -60,7 +63,9 @@ public final class OfxLog {
         write("boot pid=" + Process.myPid()
                 + " proc=" + processName()
                 + " sdk=" + Build.VERSION.SDK_INT
-                + " model=" + Build.MODEL);
+                + " model=" + Build.MODEL
+                + " fd=" + logFd()
+                + " mode=" + mode());
     }
 
     public static void log(String msg) {
@@ -87,6 +92,82 @@ public final class OfxLog {
         }, "ofx-drain");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * Detached append-mode fd to this log file. Native code writes straight into
+     * it, so a trace line survives a hard SIGSEGV later in the same process.
+     * Returns -1 when MediaStore gives us nothing.
+     */
+    public static int logFd() {
+        int have = fd;
+        if (have >= 0) {
+            return have;
+        }
+        Context c = ctx;
+        if (c == null) {
+            return -1;
+        }
+        synchronized (OfxLog.class) {
+            if (fd >= 0) {
+                return fd;
+            }
+            try {
+                Uri u = uri;
+                if (u == null) {
+                    u = findOrCreate(c);
+                    uri = u;
+                }
+                if (u == null) {
+                    return -1;
+                }
+                ParcelFileDescriptor p = c.getContentResolver().openFileDescriptor(u, "wa");
+                if (p == null) {
+                    return -1;
+                }
+                fd = p.detachFd();
+                return fd;
+            } catch (Throwable t) {
+                return -1;
+            }
+        }
+    }
+
+    /**
+     * Stealth bitmask: 1 props, 2 cmdline, 4 status, 8 maps, 16 root paths.
+     * Read from /sdcard/Download/hardbox-mode.txt, so the layer can be bisected
+     * from the phone without a rebuild. Missing file = 31 (everything on).
+     */
+    public static int mode() {
+        int have = cachedMode;
+        if (have >= 0) {
+            return have;
+        }
+        int m = 31;
+        try {
+            File f = new File(Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS), "hardbox-mode.txt");
+            if (!f.canRead()) {
+                Context c = ctx;
+                if (c != null) {
+                    f = new File(c.getFilesDir(), "hardbox-mode.txt");
+                }
+            }
+            if (f.canRead()) {
+                java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f));
+                String s = r.readLine();
+                r.close();
+                if (s != null) {
+                    m = Integer.parseInt(s.trim());
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (m < 0) {
+            m = 0;
+        }
+        cachedMode = m;
+        return m;
     }
 
     private static String processName() {
