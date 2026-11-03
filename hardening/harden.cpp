@@ -1,19 +1,16 @@
-// harden.cpp — real libc-level anti-detection for the BlackBox container.
+// harden.cpp — anti-detection for the BlackBox container, guest processes only.
 //
-// BlackBox ships Utils/AntiDetection.cpp, but its install_file_hooks() opens
-// libc.so and closes it without ever patching a symbol — the file hooks are
-// dead code. This file does the work for real, via Dobby (already vendored).
+// The container itself works on Android 16 (guest :pN spawns, Application binds).
+// What fails is the game's own anti-cheat: it looks at the process it is running
+// in and finds container fingerprints. This layer removes them and writes a
+// trace of everything the game inspects to
+//   /storage/emulated/0/Android/data/top.niunaijun.blackbox/files/harden.log
+// (own external dir, no permission needed on any API level, readable from the
+// build sandbox).
 //
-// Covered:
-//   __system_property_get / __system_property_find   emulator + root props
-//   stat / lstat / access                            root + container markers
-//   open / openat / fopen                            /proc/self/maps|smaps|cmdline
-//   uname                                            kernel banner
-//   readdir                                          marker names in listings
-//   execve / ptrace                                  su spawn, debugger attach
-//
-// Scrubbed /proc content is served from an anonymous memfd: no path exists on
-// disk, nothing to find, and the fd is CLOEXEC.
+// Installation is triggered from BActivityThread.initProcess via the JNI call
+// NativeCore.ofxSetGuestPackage(String) — that only ever happens inside a guest
+// process, and it hands us the guest package name we need for the scrub.
 
 #include <jni.h>
 #include <android/log.h>
@@ -21,12 +18,9 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
-#include <sys/utsname.h>
-#include <sys/ptrace.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <dirent.h>
 #include <dlfcn.h>
 #include <cerrno>
 #include <cstring>
@@ -36,6 +30,7 @@
 #include <cstdarg>
 #include <string>
 #include <atomic>
+#include <mutex>
 
 #include "Dobby/dobby.h"
 
@@ -44,84 +39,129 @@
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
 #endif
+#ifndef SYS_mkdirat
+#define SYS_mkdirat __NR_mkdirat
+#endif
 
 namespace {
 
 std::atomic<bool> g_installed{false};
+std::atomic<int> g_budget{4000};
 
-struct PropEntry { const char* key; const char* value; };
+char g_pkg[128] = {0};
+std::mutex g_mtx;
 
-const PropEntry kProps[] = {
-    {"ro.hardware",                "qcom"},
-    {"ro.kernel.qemu",             ""},
-    {"ro.kernel.qemu.gles",        ""},
-    {"ro.boot.qemu",               ""},
-    {"ro.product.model",           "SM-S918B"},
-    {"ro.product.manufacturer",    "samsung"},
-    {"ro.product.brand",           "samsung"},
-    {"ro.product.device",          "dm3q"},
-    {"ro.product.name",            "dm3qxx"},
-    {"ro.product.board",           "kalama"},
-    {"ro.build.tags",              "release-keys"},
-    {"ro.build.type",              "user"},
-    {"ro.build.host",              "r13"},
-    {"ro.build.user",              "dpi"},
-    {"ro.build.flavor",            "dm3qxx-user"},
-    {"ro.build.version.release",   "14"},
-    {"ro.build.version.sdk",       "34"},
-    {"ro.build.fingerprint",       "samsung/dm3qxx/dm3q:14/UP1A.231005.007/S918BXXS5CWH6:user/release-keys"},
-    {"ro.debuggable",              "0"},
-    {"ro.secure",                  "1"},
-    {"ro.adb.secure",              "1"},
-    {"ro.boot.verifiedbootstate",  "green"},
-    {"ro.boot.flash.locked",       "1"},
-    {"ro.boot.vbmeta.device_state","locked"},
-    {"ro.boot.veritymode",         "enforcing"},
-    {"ro.sys.safemode",            "0"},
-    {"ro.dalvik.vm.native.bridge", "0"},
+const char* guestPkg() {
+    return g_pkg[0] ? g_pkg : "android";
+}
+
+// ---------------------------------------------------------------------------
+// native trace -> app's own external dir (no permissions, any API level)
+// ---------------------------------------------------------------------------
+const char* logPath() {
+    static char p[256] = {0};
+    if (p[0]) return p;
+    const char* base = "/storage/emulated/0/Android/data/top.niunaijun.blackbox/files";
+    syscall(SYS_mkdirat, AT_FDCWD, "/storage/emulated/0/Android/data/top.niunaijun.blackbox", 0771);
+    syscall(SYS_mkdirat, AT_FDCWD, base, 0771);
+    snprintf(p, sizeof(p), "%s/harden.log", base);
+    return p;
+}
+
+void nlogRaw(const char* tag, const char* detail) {
+    if (g_budget.fetch_sub(1) <= 0) return;
+    char line[600];
+    int n = snprintf(line, sizeof(line), "[%d] %s %s\n", (int)getpid(), tag, detail);
+    if (n <= 0) return;
+    if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, logPath(),
+                          O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    if (fd < 0) return;
+    syscall(SYS_write, fd, line, (size_t)n);
+    syscall(SYS_close, fd);
+}
+
+uint32_t fnv(const char* s) {
+    uint32_t h = 2166136261u;
+    while (s && *s) { h ^= (uint32_t)(unsigned char)*s++; h *= 16777619u; }
+    return h;
+}
+
+// Log each distinct path/property once: the point is the list of probes the
+// anti-cheat makes, not the volume.
+bool firstTime(const char* s) {
+    static uint32_t seen[512];
+    static int used = 0;
+    std::lock_guard<std::mutex> lk(g_mtx);
+    uint32_t h = fnv(s);
+    for (int i = 0; i < used; i++) if (seen[i] == h) return false;
+    if (used < 512) seen[used++] = h;
+    return true;
+}
+
+void trace(const char* tag, const char* s) {
+    if (s && firstTime(s)) nlogRaw(tag, s);
+}
+
+// ---------------------------------------------------------------------------
+// what the container leaks
+// ---------------------------------------------------------------------------
+const char* kProps[][2] = {
+    {"ro.kernel.qemu",              ""},
+    {"ro.kernel.qemu.gles",         ""},
+    {"ro.boot.qemu",                ""},
+    {"ro.build.tags",               "release-keys"},
+    {"ro.build.type",               "user"},
+    {"ro.debuggable",               "0"},
+    {"ro.secure",                   "1"},
+    {"ro.adb.secure",               "1"},
+    {"ro.boot.verifiedbootstate",   "green"},
+    {"ro.boot.flash.locked",        "1"},
+    {"ro.boot.vbmeta.device_state", "locked"},
+    {"ro.boot.veritymode",          "enforcing"},
+    {"ro.sys.safemode",             "0"},
+    {"ro.dalvik.vm.native.bridge",  "0"},
     {"ro.enable.native.bridge.exec","0"},
-    {"sys.oem_unlock_allowed",     "0"},
-    {"ro.boot.warranty_bit",       "0"},
-    {"ro.warranty_bit",            "0"},
-    {"service.adb.root",           "0"},
-    {"init.svc.vendor.qemu-props", ""},
+    {"sys.oem_unlock_allowed",      "0"},
+    {"ro.boot.warranty_bit",        "0"},
+    {"ro.warranty_bit",             "0"},
+    {"service.adb.root",            "0"},
 };
 
 const char* kHiddenProps[] = {
     "persist.magisk.hide",
     "ro.virtual",
     "ro.debuggable.qemu",
+    "init.svc.magisk",
 };
 
-// Anything containing these is treated as a container fingerprint.
-const char* kMarks[] = {
-    "virtualapp", "vspace", "blackbox", "xposed", "magisk",
+// line markers dropped from /proc output
+const char* kDropMarks[] = {
+    "virtualapp", "vspace", "sandhook", "xposed", "magisk",
     "frida", "gum-js", "substrate", "tcpdump", "lspd",
-    "multiapp", "dualapp", "parallel.",
+    "multiapp", "dualapp", "parallel.", "dobby", "memfd:",
 };
 
 const char* kPaths[] = {
     "/system/bin/su", "/system/xbin/su", "/sbin/su", "/su/bin/su",
     "/data/adb", "/system/app/Superuser.apk", "/dev/socket/su",
-    "/system/lib/libdvm.so", "/system/lib64/libdvm.so",
-    "/system/lib/libc_malloc_debug.so",
 };
-
-bool selfPath(const char* p) {
-    return p && (strstr(p, "top.niunaijun.blackbox") != nullptr
-              || strstr(p, "/data/app/") != nullptr);
-}
 
 bool hiddenPath(const char* p) {
     if (!p) return false;
-    if (selfPath(p)) return false;
     for (const char* x : kPaths) if (strstr(p, x)) return true;
-    for (const char* m : kMarks) if (strstr(p, m)) return true;
     return false;
 }
 
+bool procTarget(const char* p) {
+    if (!p || strncmp(p, "/proc/", 6) != 0) return false;
+    return strstr(p, "/maps") || strstr(p, "/smaps")
+        || strstr(p, "/cmdline") || strstr(p, "/status")
+        || strstr(p, "/mountinfo") || strstr(p, "/task/");
+}
+
 // ---------------------------------------------------------------------------
-// memfd-backed scrubbed file
+// memfd
 // ---------------------------------------------------------------------------
 int memfdFor(const std::string& data) {
     int fd = (int)syscall(SYS_memfd_create, "jit-cache", MFD_CLOEXEC);
@@ -136,30 +176,16 @@ int memfdFor(const std::string& data) {
     return fd;
 }
 
-bool procTarget(const char* p) {
-    if (!p) return false;
-    return strstr(p, "/proc/self/maps") || strstr(p, "/proc/self/smaps")
-        || strstr(p, "/proc/self/task/") || strstr(p, "/proc/self/map_files")
-        || strstr(p, "/proc/self/cmdline");
+void replaceAll(std::string& s, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
 }
 
-int scrubbedOpen(const char* path) {
-    if (strstr(path, "cmdline")) {
-        // Report the host process name; never recurse into fopen (hooked).
-        std::string s = "top.niunaijun.blackbox";
-        s.push_back('\0');
-        return memfdFor(s);
-    }
-
-    int in = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
-    if (in < 0) return in;
-
-    std::string raw;
-    char buf[8192];
-    ssize_t n;
-    while ((n = read(in, buf, sizeof(buf))) > 0) raw.append(buf, (size_t)n);
-    close(in);
-
+std::string sanitize(const std::string& raw, bool statusMode) {
     std::string out;
     out.reserve(raw.size() + 64);
     size_t pos = 0;
@@ -169,65 +195,84 @@ int scrubbedOpen(const char* path) {
         std::string line = raw.substr(pos, nl - pos);
         pos = nl + 1;
 
+        if (statusMode && line.compare(0, 5, "Name:") == 0) {
+            std::string pkg = guestPkg();
+            if (pkg.size() > 15) pkg.resize(15);
+            out += "Name:\t" + pkg + "\n";
+            continue;
+        }
+
+        replaceAll(line, "top.niunaijun.blackbox", guestPkg());
+        replaceAll(line, "/files/blackbox/", "/files/");
+
         bool drop = false;
-        for (const char* m : kMarks) if (line.find(m) != std::string::npos) { drop = true; break; }
-        if (!drop && line.find("memfd:") != std::string::npos) drop = true;
-        if (!drop && line.find("/dev/ashmem/") != std::string::npos) drop = true;
-        if (!drop && line.find("/data/app/") != std::string::npos
-            && line.find("base.apk!") != std::string::npos) drop = true;
-        if (!drop) { out += line; out += '\n'; }
+        for (const char* m : kDropMarks) {
+            if (line.find(m) != std::string::npos) { drop = true; break; }
+        }
+        if (!drop && line.find("libblackbox") != std::string::npos) drop = true;
+        if (drop) continue;
+
+        out += line;
+        out += '\n';
     }
-    return memfdFor(out);
+    return out;
+}
+
+int scrubbedOpen(const char* path) {
+    if (strstr(path, "cmdline")) {
+        std::string s = guestPkg();
+        s.push_back('\0');
+        return memfdFor(s);
+    }
+
+    int in = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
+    if (in < 0) return in;
+
+    std::string raw;
+    char buf[16384];
+    ssize_t n;
+    while ((n = read(in, buf, sizeof(buf))) > 0) raw.append(buf, (size_t)n);
+    close(in);
+
+    bool statusMode = strstr(path, "status") != nullptr;
+    return memfdFor(sanitize(raw, statusMode));
 }
 
 // ---------------------------------------------------------------------------
 // hooks
 // ---------------------------------------------------------------------------
 typedef int (*propGetFn)(const char*, char*);
-typedef const void* (*propFindFn)(const char*);
 typedef int (*statFn)(const char*, struct stat*);
 typedef int (*accessFn)(const char*, int);
 typedef int (*openFn)(const char*, int, ...);
 typedef int (*openatFn)(int, const char*, int, ...);
 typedef FILE* (*fopenFn)(const char*, const char*);
-typedef int (*unameFn)(struct utsname*);
-typedef struct dirent* (*readdirFn)(DIR*);
-typedef int (*execveFn)(const char*, char* const[], char* const[]);
-typedef long (*ptraceFn)(int, pid_t, void*, void*);
 
-propGetFn  origPropGet;
-propFindFn origPropFind;
-statFn     origStat, origLstat;
-accessFn   origAccess;
-openFn     origOpen;
-openatFn   origOpenat;
-fopenFn    origFopen;
-unameFn    origUname;
-readdirFn  origReaddir;
-execveFn   origExecve;
-ptraceFn   origPtrace;
+propGetFn origPropGet;
+statFn    origStat, origLstat;
+accessFn  origAccess;
+openFn    origOpen;
+openatFn  origOpenat;
+fopenFn   origFopen;
 
 int hookPropGet(const char* key, char* out) {
     if (!key) return origPropGet ? origPropGet(key, out) : 0;
-    for (const auto& p : kProps) {
-        if (strcmp(key, p.key) == 0) {
-            size_t n = strlen(p.value);
-            if (out) memcpy(out, p.value, n + 1);
-            return (int)n;
-        }
-    }
     for (const char* h : kHiddenProps) {
         if (strcmp(key, h) == 0) { if (out) out[0] = '\0'; return 0; }
     }
-    return origPropGet ? origPropGet(key, out) : 0;
-}
-
-const void* hookPropFind(const char* key) {
-    if (key) {
-        for (const char* h : kHiddenProps) if (strcmp(key, h) == 0) return nullptr;
-        for (const char* m : kMarks) if (strstr(key, m)) return nullptr;
+    for (const auto& p : kProps) {
+        if (strcmp(key, p[0]) == 0) {
+            trace("prop", key);
+            size_t n = strlen(p[1]);
+            if (out) memcpy(out, p[1], n + 1);
+            return (int)n;
+        }
     }
-    return origPropFind ? origPropFind(key) : nullptr;
+    if (strncmp(key, "ro.", 3) == 0 || strncmp(key, "init.svc.", 9) == 0 ||
+        strncmp(key, "gsm.", 4) == 0 || strncmp(key, "persist.", 8) == 0) {
+        trace("prop", key);
+    }
+    return origPropGet ? origPropGet(key, out) : 0;
 }
 
 int hookStat(const char* p, struct stat* b) {
@@ -247,9 +292,11 @@ int hookOpen(const char* p, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
     if (procTarget(p)) {
+        trace("open", p);
         int fd = scrubbedOpen(p);
         if (fd >= 0) return fd;
-        errno = EACCES; return -1;
+        errno = EACCES;
+        return -1;
     }
     if (hiddenPath(p)) { errno = ENOENT; return -1; }
     return origOpen(p, flags, mode);
@@ -259,9 +306,11 @@ int hookOpenat(int dirfd, const char* p, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
     if (procTarget(p)) {
+        trace("openat", p);
         int fd = scrubbedOpen(p);
         if (fd >= 0) return fd;
-        errno = EACCES; return -1;
+        errno = EACCES;
+        return -1;
     }
     if (hiddenPath(p)) { errno = ENOENT; return -1; }
     return origOpenat(dirfd, p, flags, mode);
@@ -269,6 +318,7 @@ int hookOpenat(int dirfd, const char* p, int flags, ...) {
 
 FILE* hookFopen(const char* p, const char* mode) {
     if (procTarget(p)) {
+        trace("fopen", p);
         int fd = scrubbedOpen(p);
         if (fd < 0) { errno = EACCES; return nullptr; }
         return fdopen(fd, "r");
@@ -277,73 +327,37 @@ FILE* hookFopen(const char* p, const char* mode) {
     return origFopen(p, mode);
 }
 
-int hookUname(struct utsname* u) {
-    int r = origUname(u);
-    if (r == 0) {
-        snprintf(u->release, sizeof(u->release), "5.15.94-android13-8-31341897-abS918BXXS5CWH6");
-        snprintf(u->version, sizeof(u->version), "#1 SMP PREEMPT Sat Jul 20 02:14:21 KST 2024");
-        snprintf(u->machine, sizeof(u->machine), "aarch64");
-    }
-    return r;
-}
-
-struct dirent* hookReaddir(DIR* d) {
-    struct dirent* e;
-    while ((e = origReaddir(d)) != nullptr) {
-        bool skip = false;
-        for (const char* m : kMarks) if (strstr(e->d_name, m)) { skip = true; break; }
-        if (!skip) return e;
-    }
-    return nullptr;
-}
-
-int hookExecve(const char* p, char* const argv[], char* const envp[]) {
-    if (p && (hiddenPath(p) || strstr(p, "/su"))) { errno = ENOENT; return -1; }
-    return origExecve(p, argv, envp);
-}
-
-long hookPtrace(int req, pid_t pid, void* addr, void* data) {
-    if (req == PTRACE_ATTACH || req == PTRACE_SEIZE) { errno = EPERM; return -1; }
-    return origPtrace(req, pid, addr, data);
-}
-
-void patch(const char* name, void* replace, void** orig) {
+void patch(const char* name, void* replace, void** orig, const char* tag) {
     void* target = dlsym(RTLD_DEFAULT, name);
-    if (!target) { HLOG("missing: %s", name); return; }
-    if (DobbyHook(target, replace, orig) != 0) HLOG("hook failed: %s", name);
+    if (!target) { nlogRaw("miss", name); return; }
+    if (DobbyHook(target, replace, orig) != 0) { nlogRaw("fail", name); return; }
+    nlogRaw("hook", tag ? tag : name);
 }
 
 } // namespace
 
-// The container host process must stay byte-identical to upstream: if a hook
-// misbehaves, the launcher dies before it can even draw. Hardening is only
-// installed inside guest processes (`top.niunaijun.blackbox:p0` etc), which is
-// where the anti-cheat actually runs anyway.
-static bool hostProcess() {
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return true; // fail closed: assume host, install nothing
-    char buf[256] = {0};
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0) return true;
-    return strcmp(buf, "top.niunaijun.blackbox") == 0;
-}
-
-extern "C" void ofx_install_hardening() {
-    if (hostProcess()) {
-        HLOG("host process: hardening deferred to guest");
-        return;
+extern "C" JNIEXPORT void JNICALL
+Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(JNIEnv *env, jclass, jstring pkg) {
+    if (!pkg) return;
+    const char* c = env->GetStringUTFChars(pkg, nullptr);
+    if (!c) return;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        strncpy(g_pkg, c, sizeof(g_pkg) - 1);
+        g_pkg[sizeof(g_pkg) - 1] = '\0';
     }
+    env->ReleaseStringUTFChars(pkg, c);
+
     if (g_installed.exchange(true)) return;
 
-    patch("__system_property_get", (void*)hookPropGet, (void**)&origPropGet);
-    patch("__system_property_find", (void*)hookPropFind, (void**)&origPropFind);
-    patch("stat", (void*)hookStat, (void**)&origStat);
-    patch("lstat", (void*)hookLstat, (void**)&origLstat);
-    patch("access", (void*)hookAccess, (void**)&origAccess);
-    patch("open", (void*)hookOpen, (void**)&origOpen);
-    patch("openat", (void*)hookOpenat, (void**)&origOpenat);
-    patch("fopen", (void*)hookFopen, (void**)&origFopen);
-
-    HLOG("hardening installed in guest");
+    nlogRaw("install", g_pkg);
+    patch("__system_property_get", (void*)hookPropGet, (void**)&origPropGet, "prop");
+    patch("stat", (void*)hookStat, (void**)&origStat, "stat");
+    patch("lstat", (void*)hookLstat, (void**)&origLstat, "lstat");
+    patch("access", (void*)hookAccess, (void**)&origAccess, "access");
+    patch("open", (void*)hookOpen, (void**)&origOpen, "open");
+    patch("openat", (void*)hookOpenat, (void**)&origOpenat, "openat");
+    patch("fopen", (void*)hookFopen, (void**)&origFopen, "fopen");
+    nlogRaw("done", "hooks installed");
+    HLOG("hardening installed for %s", g_pkg);
 }
