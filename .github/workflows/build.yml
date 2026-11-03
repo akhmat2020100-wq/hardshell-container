@@ -67,17 +67,19 @@ jobs:
           # ---------- guest boot: hand the package name to native, install hooks ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
-          if "ofxSetGuestPackage" not in s:
+          if "ofxGuestLoggerInstalled" not in s:
               s = sub(s, "            this.mAppConfig = appConfig;",
                       "            this.mAppConfig = appConfig;\n"
                       "            try {\n"
                       "                // Guest process never runs host App.kt, so install the logger here.\n"
                       "                // Without this, OfxLog.ctx is null in the guest and all guest\n"
                       "                // logs (and the native fd) are silently dropped.\n"
+                      "                // NOTE: hooks are NOT installed here anymore. The guest hangs in\n"
+                      "                // IOCore.enableRedirect (see bind step log) when our Dobby hooks\n"
+                      "                // are already on open/openat, conflicting with BlackBox IO hooks.\n"
+                      "                // Hooks are installed after enableRedirect, in handleBindApplication.\n"
                       "                try { top.niunaijun.blackbox.util.OfxLog.install(top.niunaijun.blackbox.BlackBoxCore.getContext()); } catch (Throwable ignored2) { }\n"
-                      "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName,\n"
-                      "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
-                      "                        top.niunaijun.blackbox.util.OfxLog.mode());\n"
+                      "                // ofxGuestLoggerInstalled marker\n"
                       "            } catch (Throwable ignored) {\n"
                       "            }",
                       "initProcess stealth hook")
@@ -239,6 +241,48 @@ jobs:
                       "        IOCore.get().enableRedirect(packageContext);\n"
                       '        OfxLog.log("bind step enableRedirect done");',
                       "bind step io")
+              wr(p, s)
+
+          # ---------- BActivityThread: install hooks AFTER enableRedirect ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "ofxAfterRedirect" not in s:
+              s = sub(s, "IOCore.get().enableRedirect(packageContext);",
+                      "IOCore.get().enableRedirect(packageContext);\n"
+                      "        OfxLog.log(\"bind step enableRedirect done\");\n"
+                      "        try {\n"
+                      "            top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(packageName,\n"
+                      "                    top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
+                      "                    top.niunaijun.blackbox.util.OfxLog.mode());\n"
+                      "            OfxLog.log(\"ofxAfterRedirect hooks installed\");\n"
+                      "        } catch (Throwable ignored3) { OfxLog.log(\"ofxAfterRedirect failed \" + ignored3); }",
+                      "hooks after redirect")
+              wr(p, s)
+
+          # ---------- IOCore: pinpoint hang inside enableRedirect ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/IOCore.java"
+          s = rd(p)
+          if "io step" not in s:
+              s = sub(s, "ApplicationInfo packageInfo = BlackBoxCore.getBPackageManager().getApplicationInfo(packageName, PackageManager.GET_META_DATA, BlackBoxCore.getUserId());",
+                      'top.niunaijun.blackbox.util.OfxLog.log("io step getAppInfo begin");\n'
+                      "            ApplicationInfo packageInfo = BlackBoxCore.getBPackageManager().getApplicationInfo(packageName, PackageManager.GET_META_DATA, BlackBoxCore.getUserId());\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("io step getAppInfo done");',
+                      "io step appinfo")
+              s = sub(s, "proc(rule);",
+                      '            top.niunaijun.blackbox.util.OfxLog.log("io step proc begin");\n'
+                      "            proc(rule);\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("io step proc done");',
+                      "io step proc")
+              s = sub(s, "for (String key : rule.keySet()) {",
+                      '        top.niunaijun.blackbox.util.OfxLog.log("io step addRedirect loop begin keys=" + rule.size());\n'
+                      "        for (String key : rule.keySet()) {",
+                      "io step loop begin")
+              s = sub(s, "NativeCore.enableIO();",
+                      '        top.niunaijun.blackbox.util.OfxLog.log("io step addRedirect loop done");\n'
+                      '        top.niunaijun.blackbox.util.OfxLog.log("io step enableIO begin");\n'
+                      "        NativeCore.enableIO();\n"
+                      '        top.niunaijun.blackbox.util.OfxLog.log("io step enableIO done");',
+                      "io step enableIO")
               wr(p, s)
 
           # ---------- Host app: install logger in every process ----------
