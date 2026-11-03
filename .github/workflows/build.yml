@@ -161,7 +161,7 @@ jobs:
           # ---------- BActivityThread: guest-side boot ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
-          if "OfxLog" not in s:
+          if "import top.niunaijun.blackbox.util.OfxLog;" not in s:
               s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
                       "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
                       "BActivityThread import")
