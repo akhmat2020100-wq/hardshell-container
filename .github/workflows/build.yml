@@ -54,11 +54,13 @@ jobs:
           # ---------- NativeCore: entry point for the stealth layer ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/NativeCore.java"
           s = rd(p)
-          if "ofxSetGuestPackage" not in s:
+          if "ofxWriteLog" not in s:
               s = sub(s, "    public static native boolean disableResourceLoading();",
                       "    public static native boolean disableResourceLoading();\n"
                       "\n"
                       "    public static native void ofxSetGuestPackage(String pkg, int logFd, int mode);\n"
+                      "\n"
+                      "    public static native void ofxWriteLog(String msg);\n"
                       "\n"
                       "    public static native String ofxDrainTrace();",
                       "NativeCore native decl")
@@ -283,6 +285,21 @@ jobs:
                       "        NativeCore.enableIO();\n"
                       '        top.niunaijun.blackbox.util.OfxLog.log("io step enableIO done");',
                       "io step enableIO")
+              wr(p, s)
+
+          # ---------- BActivityThread: steps after redirect, before makeApplication ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "bind step AppBindData" not in s:
+              s = sub(s, "AppBindData bindData = new AppBindData();",
+                      '        OfxLog.log("bind step AppBindData begin");\n'
+                      "        AppBindData bindData = new AppBindData();\n"
+                      '        OfxLog.log("bind step AppBindData done");',
+                      "bind step appbind")
+              s = sub(s, "if (BRNetworkSecurityConfigProvider.getRealClass() != null) {",
+                      '        OfxLog.log("bind step NetworkSecurity begin");\n'
+                      "        if (BRNetworkSecurityConfigProvider.getRealClass() != null) {",
+                      "bind step netsec")
               wr(p, s)
 
           # ---------- Host app: install logger in every process ----------
