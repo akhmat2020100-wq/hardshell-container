@@ -58,7 +58,9 @@ jobs:
               s = sub(s, "    public static native boolean disableResourceLoading();",
                       "    public static native boolean disableResourceLoading();\n"
                       "\n"
-                      "    public static native void ofxSetGuestPackage(String pkg);",
+                      "    public static native void ofxSetGuestPackage(String pkg);\n"
+                      "\n"
+                      "    public static native String ofxDrainTrace();",
                       "NativeCore native decl")
               wr(p, s)
 
