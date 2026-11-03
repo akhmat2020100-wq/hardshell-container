@@ -58,7 +58,7 @@ jobs:
               s = sub(s, "    public static native boolean disableResourceLoading();",
                       "    public static native boolean disableResourceLoading();\n"
                       "\n"
-                      "    public static native void ofxSetGuestPackage(String pkg);\n"
+                      "    public static native void ofxSetGuestPackage(String pkg, int logFd, int mode);\n"
                       "\n"
                       "    public static native String ofxDrainTrace();",
                       "NativeCore native decl")
@@ -71,7 +71,9 @@ jobs:
               s = sub(s, "            this.mAppConfig = appConfig;",
                       "            this.mAppConfig = appConfig;\n"
                       "            try {\n"
-                      "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName);\n"
+                      "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName,\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.mode());\n"
                       "            } catch (Throwable ignored) {\n"
                       "            }",
                       "initProcess stealth hook")
@@ -167,6 +169,30 @@ jobs:
                       "    public void bindApplication(final String packageName, final String processName) {\n"
                       '        OfxLog.log("bindApplication " + packageName + "/" + processName);',
                       "bindApplication")
+              wr(p, s)
+
+          # ---------- BActivityThread: how far guest boot actually got ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "makeApplication begin" not in s:
+              s = sub(s, "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);",
+                      '                OfxLog.log("makeApplication begin " + packageName);\n'
+                      "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);\n"
+                      '                OfxLog.log("makeApplication done " + (application != null));',
+                      "makeApplication log")
+              s = sub(s, "            onBeforeApplicationOnCreate(packageName, processName, application);",
+                      '            OfxLog.log("Application.onCreate begin " + application.getClass().getName());\n'
+                      "            onBeforeApplicationOnCreate(packageName, processName, application);",
+                      "onCreate begin")
+              s = sub(s, "            onAfterApplicationOnCreate(packageName, processName, application);",
+                      "            onAfterApplicationOnCreate(packageName, processName, application);\n"
+                      '            OfxLog.log("Application.onCreate done");',
+                      "onCreate done")
+              s = sub(s, '            Slog.e(TAG, "Critical error in handleBindApplication", e);',
+                      '            Slog.e(TAG, "Critical error in handleBindApplication", e);\n'
+                      '            OfxLog.log("BIND FAILED " + e);\n'
+                      "            OfxLog.log(android.util.Log.getStackTraceString(e));",
+                      "bind catch")
               wr(p, s)
 
           # ---------- Host app: install logger in every process ----------
