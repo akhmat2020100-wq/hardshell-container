@@ -1,0 +1,46 @@
+name: build-container
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream (BlackBox fork, modern NDK/AGP)
+        run: |
+          git clone --depth 1 https://github.com/JDKaintscared/BlackBox.git src
+          cd src
+          git log -1 --oneline
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Android SDK components
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SM" ] || SM="sdkmanager"
+          yes | "$SM" --licenses > /dev/null || true
+          yes | "$SM" --install "ndk;29.0.13846066" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0" > /dev/null || true
+          echo "sdk.dir=$SDK" >> src/local.properties
+          echo "ndk.dir=$SDK/ndk/29.0.13846066" >> src/local.properties
+
+      - name: Build
+        working-directory: src
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackbox-apk
+          path: src/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
