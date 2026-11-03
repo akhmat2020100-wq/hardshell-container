@@ -24,6 +24,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dlfcn.h>
