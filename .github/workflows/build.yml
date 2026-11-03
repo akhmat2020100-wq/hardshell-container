@@ -200,6 +200,12 @@ jobs:
                       "onCreate begin")
               s = sub(s, "            onAfterApplicationOnCreate(packageName, processName, application);",
                       "            onAfterApplicationOnCreate(packageName, processName, application);\n"
+                      "            try {\n"
+                      "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(packageName,\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.mode());\n"
+                      '                OfxLog.log("ofxAfterOnCreate hooks installed");\n'
+                      "            } catch (Throwable ignored4) { OfxLog.log(\"ofxAfterOnCreate failed \" + ignored4); }\n"
                       '            OfxLog.log("Application.onCreate done");',
                       "onCreate done")
               s = sub(s, '            Slog.e(TAG, "Critical error in handleBindApplication", e);',
@@ -245,20 +251,19 @@ jobs:
                       "bind step io")
               wr(p, s)
 
-          # ---------- BActivityThread: install hooks AFTER enableRedirect ----------
+          # ---------- BActivityThread: DEFER hooks to after Application.onCreate ----------
+          # Mode 64 proves makeApplication + onCreate pass without hooks, and
+          # mode 31 hangs inside makeApplication with hooks. So hooks must NOT
+          # be active during Application loading. They are installed in
+          # onAfterApplicationOnCreate below, before any Activity / Unity code.
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
-          if "ofxAfterRedirect" not in s:
+          if "ofxDeferredHooks" not in s:
               s = sub(s, "IOCore.get().enableRedirect(packageContext);",
                       "IOCore.get().enableRedirect(packageContext);\n"
                       "        OfxLog.log(\"bind step enableRedirect done\");\n"
-                      "        try {\n"
-                      "            top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(packageName,\n"
-                      "                    top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
-                      "                    top.niunaijun.blackbox.util.OfxLog.mode());\n"
-                      "            OfxLog.log(\"ofxAfterRedirect hooks installed\");\n"
-                      "        } catch (Throwable ignored3) { OfxLog.log(\"ofxAfterRedirect failed \" + ignored3); }",
-                      "hooks after redirect")
+                      "        OfxLog.log(\"ofxDeferredHooks: hooks deferred to onCreate done\");",
+                      "hooks deferred")
               wr(p, s)
 
           # ---------- IOCore: pinpoint hang inside enableRedirect ----------
