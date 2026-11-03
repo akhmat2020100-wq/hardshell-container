@@ -2,22 +2,25 @@
 //
 // Installed from BActivityThread.initProcess through
 //   NativeCore.ofxSetGuestPackage(String pkg, int logFd, int mode)
-// which only ever runs inside a guest process and hands us three things:
-//   * the guest package name, needed for the /proc scrub
-//   * a detached MediaStore file descriptor opened in append mode, so every
-//     trace line is on disk the moment it happens (a native crash cannot lose it)
-//   * the mode bitmask, so the stealth can be bisected without a rebuild:
-//       1  mask root/emulator properties
-//       2  /proc/self/cmdline      -> guest package
-//       4  /proc/self/status Name  -> guest package
-//       8  /proc/self/maps|smaps   -> container paths rewritten, our libs dropped
-//      16  root/container marker paths (su, magisk, blackbox data dir) -> ENOENT
 //
-// The mode comes from /sdcard/Download/hardbox-mode.txt (first line, integer);
-// missing file = 31 = everything on.
+// mode bitmask (read from /sdcard/Download/hardbox-mode.txt):
+//    1  mask root/emulator properties
+//    2  /proc/self/cmdline   -> guest package
+//    4  /proc/self/status    -> Name / comm rewritten
+//    8  /proc/self/maps      -> container paths rewritten, our libs dropped
+//   16  root marker paths    -> ENOENT
+//   64  install NO hooks at all (bisect: is the hook layer itself the problem?)
+//
+// Everything is written straight into the append-mode fd the Java side hands
+// over, so a native crash cannot swallow the trace. A SIGSEGV handler logs the
+// faulting pc plus the /proc/self/maps line it belongs to; a heartbeat thread
+// proves the process was alive and when it stopped being alive.
 
 #include <jni.h>
 #include <android/log.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <pthread.h>
 #include <link.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -25,6 +28,7 @@
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dlfcn.h>
@@ -45,9 +49,6 @@
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
 #endif
-#ifndef SYS_mkdirat
-#define SYS_mkdirat __NR_mkdirat
-#endif
 
 namespace {
 
@@ -57,16 +58,18 @@ enum {
     M_STATUS    = 4,
     M_MAPS      = 8,
     M_ROOTPATHS = 16,
+    M_NOHOOKS   = 64,
 };
 
 std::atomic<bool> g_installed{false};
 std::atomic<int>  g_budget{30000};
+std::atomic<bool> g_hbStop{false};
 
 int  g_logFd = -1;
-int  g_mode  = M_PROPS | M_CMDLINE | M_STATUS | M_MAPS | M_ROOTPATHS;
+int  g_mode  = 0;
 char g_pkg[128] = {0};
 std::mutex g_mtx;
-std::string g_buf;   // fallback when no fd was handed over
+std::string g_buf;
 
 bool modeOn(int bit) { return (g_mode & bit) != 0; }
 
@@ -75,7 +78,7 @@ const char* guestPkg() {
 }
 
 // ---------------------------------------------------------------------------
-// trace: straight to the append-mode fd, one write per line
+// trace
 // ---------------------------------------------------------------------------
 void rawWrite(const char* data, size_t n) {
     if (g_logFd >= 0) {
@@ -106,7 +109,6 @@ uint32_t fnv(const char* s) {
     return h;
 }
 
-// Log each distinct probe once: we want the anti-cheat's checklist, not volume.
 bool firstTime(const char* s) {
     static uint32_t seen[1024];
     static int used = 0;
@@ -120,6 +122,83 @@ bool firstTime(const char* s) {
 void trace(const char* tag, const char* s) {
     if (!s || !firstTime(s)) return;
     nlogRaw(tag, s);
+}
+
+// ---------------------------------------------------------------------------
+// crash handler: sig + faulting pc + the maps line that owns it
+// ---------------------------------------------------------------------------
+char g_maps[65536];
+
+void mapsScan(uintptr_t pc) {
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    ssize_t n = (ssize_t)syscall(SYS_read, fd, g_maps, sizeof(g_maps) - 1);
+    syscall(SYS_close, fd);
+    if (n <= 0) return;
+    g_maps[n] = '\0';
+
+    char* p = g_maps;
+    while (p && *p) {
+        char* nl = strchr(p, '\n');
+        unsigned long a = 0, b = 0;
+        if (sscanf(p, "%lx-%lx", &a, &b) == 2 && pc >= a && pc < b) {
+            nlogRaw("crashmap", p);
+            return;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
+void sigHandler(int sig, siginfo_t* si, void* uc) {
+    uintptr_t pc = 0, lr = 0, sp = 0;
+    ucontext_t* u = (ucontext_t*)uc;
+#if defined(__aarch64__)
+    if (u) {
+        pc = (uintptr_t)u->uc_mcontext.pc;
+        lr = (uintptr_t)u->uc_mcontext.regs[30];
+        sp = (uintptr_t)u->uc_mcontext.sp;
+    }
+#elif defined(__arm__)
+    if (u) {
+        pc = (uintptr_t)u->uc_mcontext.arm_pc;
+        lr = (uintptr_t)u->uc_mcontext.arm_lr;
+        sp = (uintptr_t)u->uc_mcontext.arm_sp;
+    }
+#endif
+    char b[256];
+    snprintf(b, sizeof(b), "sig=%d addr=%p pc=%p lr=%p sp=%p",
+             sig, si ? si->si_addr : nullptr, (void*)pc, (void*)lr, (void*)sp);
+    nlogRaw("CRASH", b);
+    if (pc) mapsScan(pc);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void installCrashHandler() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = {SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
+    for (int s : sigs) sigaction(s, &sa, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// heartbeat: proves when the process stopped breathing
+// ---------------------------------------------------------------------------
+void* hbThread(void*) {
+    for (int i = 0; i < 90 && !g_hbStop.load(); i++) {
+        char b[32];
+        snprintf(b, sizeof(b), "hb %d", i);
+        nlogRaw("alive", b);
+        struct timespec ts;
+        ts.tv_sec = 2;
+        ts.tv_nsec = 0;
+        nanosleep(&ts, nullptr);
+    }
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +233,6 @@ const char* kHiddenProps[] = {
     "init.svc.magisk",
 };
 
-// substrings that make a /proc line or module name a giveaway
 const char* kMarks[] = {
     "blackbox", "sandbox", "sandhook", "virtualapp", "vspace", "xposed",
     "magisk", "frida", "gum-js", "substrate", "lspd", "multiapp", "dualapp",
@@ -219,7 +297,6 @@ void replaceAll(std::string& s, const std::string& from, const std::string& to) 
     }
 }
 
-// Everything the container imprints on a path becomes the guest's own app dir.
 void rewritePaths(std::string& line) {
     static std::string app = std::string("/data/app/~~ofxQm9w==/") + guestPkg() + "-ofxQm9w==";
     static std::string host1 = "/data/user/0/top.niunaijun.blackbox/files/blackbox/";
@@ -308,10 +385,10 @@ typedef int   (*statFn)(const char*, struct stat*);
 typedef int   (*accessFn)(const char*, int);
 typedef int   (*openFn)(const char*, int, ...);
 typedef int   (*openatFn)(int, const char*, int, ...);
+typedef int   (*open2Fn)(const char*, int);
+typedef int   (*openat2Fn)(int, const char*, int);
 typedef FILE* (*fopenFn)(const char*, const char*);
 typedef int   (*unameFn)(struct utsname*);
-typedef int   (*dlIterFn)(int (*)(struct dl_phdr_info*, size_t, void*), void*);
-typedef int   (*dladdrFn)(const void*, Dl_info*);
 typedef int   (*execveFn)(const char*, char* const[], char* const[]);
 typedef ssize_t (*readlinkFn)(const char*, char*, size_t);
 
@@ -321,10 +398,10 @@ statFn     origStat, origLstat;
 accessFn   origAccess;
 openFn     origOpen;
 openatFn   origOpenat;
+open2Fn    origOpen2;
+openat2Fn  origOpenat2;
 fopenFn    origFopen;
 unameFn    origUname;
-dlIterFn   origDlIter;
-dladdrFn   origDladdr;
 execveFn   origExecve;
 readlinkFn origReadlink;
 
@@ -403,6 +480,32 @@ int hookOpenat(int dirfd, const char* p, int flags, ...) {
     return origOpenat ? origOpenat(dirfd, p, flags, mode) : -1;
 }
 
+// FORTIFY variants: two arguments, no mode. Kept separate from open/openat so
+// the trampolines never point at each other (that used to recurse forever).
+int hookOpen2(const char* p, int flags) {
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("open2", p);
+    if (scrubThisOpen(p)) {
+        int fd = scrubbedOpen(p);
+        if (fd >= 0) return fd;
+        errno = EACCES;
+        return -1;
+    }
+    if (modeOn(M_ROOTPATHS) && hiddenPath(p)) { errno = ENOENT; return -1; }
+    return origOpen2 ? origOpen2(p, flags) : -1;
+}
+
+int hookOpenat2(int dirfd, const char* p, int flags) {
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("openat2", p);
+    if (scrubThisOpen(p)) {
+        int fd = scrubbedOpen(p);
+        if (fd >= 0) return fd;
+        errno = EACCES;
+        return -1;
+    }
+    if (modeOn(M_ROOTPATHS) && hiddenPath(p)) { errno = ENOENT; return -1; }
+    return origOpenat2 ? origOpenat2(dirfd, p, flags) : -1;
+}
+
 FILE* hookFopen(const char* p, const char* mode) {
     if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("fopen", p);
     if (scrubThisOpen(p)) {
@@ -421,28 +524,6 @@ int hookUname(struct utsname* u) {
         snprintf(b, sizeof(b), "%s %s %s", u->sysname, u->release, u->machine);
         trace("uname", b);
     }
-    return r;
-}
-
-struct DlCtx { int (*cb)(struct dl_phdr_info*, size_t, void*); void* user; };
-
-int dlTrampoline(struct dl_phdr_info* info, size_t sz, void* data) {
-    DlCtx* c = (DlCtx*)data;
-    if (info && info->dlpi_name && marked(info->dlpi_name)) {
-        trace("mod", info->dlpi_name);
-        if (modeOn(M_MAPS)) return 0;   // pretend the container module is not there
-    }
-    return c->cb(info, sz, c->user);
-}
-
-int hookDlIterate(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) {
-    DlCtx c{cb, data};
-    return origDlIter ? origDlIter(dlTrampoline, &c) : 0;
-}
-
-int hookDladdr(const void* addr, Dl_info* info) {
-    int r = origDladdr ? origDladdr(addr, info) : 0;
-    if (r && info && info->dli_fname) trace("dladdr", info->dli_fname);
     return r;
 }
 
@@ -474,6 +555,14 @@ void patch(const char* name, void* replace, void** orig, const char* tag) {
     if (!target) { nlogRaw("miss", name); return; }
     if (DobbyHook(target, replace, orig) != 0) { nlogRaw("fail", name); return; }
     nlogRaw("hook", tag ? tag : name);
+}
+
+void logSymbols() {
+    char b[256];
+    snprintf(b, sizeof(b), "open=%p open2=%p openat=%p openat2=%p prop=%p propfind=%p",
+             sym("open"), sym("__open_2"), sym("openat"), sym("__openat_2"),
+             sym("__system_property_get"), sym("__system_property_find"));
+    nlogRaw("sym", b);
 }
 
 } // namespace
@@ -509,23 +598,48 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     char head[256];
     snprintf(head, sizeof(head), "%s fd=%d mode=%d", g_pkg, g_logFd, g_mode);
     nlogRaw("install", head);
-    nlogRaw("mypid", std::to_string(getpid()).c_str());
+
+    installCrashHandler();
+
+    pthread_t th;
+    if (pthread_create(&th, nullptr, hbThread, nullptr) == 0) pthread_detach(th);
+
+    if (modeOn(M_NOHOOKS)) {
+        nlogRaw("hooks", "off (mode 64)");
+        HLOG("hardening %s mode=%d NO HOOKS", g_pkg, g_mode);
+        return;
+    }
+
+    logSymbols();
 
     patch("__system_property_get",  (void*)hookPropGet,  (void**)&origPropGet,  "propget");
     patch("__system_property_find", (void*)hookPropFind, (void**)&origPropFind, "propfind");
     patch("open",                   (void*)hookOpen,     (void**)&origOpen,     "open");
     patch("openat",                 (void*)hookOpenat,   (void**)&origOpenat,   "openat");
-    patch("__open_2",               (void*)hookOpen,     (void**)&origOpen,     "open2");
-    patch("__openat_2",             (void*)hookOpenat,   (void**)&origOpenat,   "openat2");
     patch("fopen",                  (void*)hookFopen,    (void**)&origFopen,    "fopen");
     patch("stat",                   (void*)hookStat,     (void**)&origStat,     "stat");
     patch("lstat",                  (void*)hookLstat,    (void**)&origLstat,    "lstat");
     patch("access",                 (void*)hookAccess,   (void**)&origAccess,   "access");
     patch("uname",                  (void*)hookUname,    (void**)&origUname,    "uname");
-    patch("dl_iterate_phdr",        (void*)hookDlIterate,(void**)&origDlIter,   "dliter");
-    patch("dladdr",                 (void*)hookDladdr,   (void**)&origDladdr,   "dladdr");
     patch("execve",                 (void*)hookExecve,   (void**)&origExecve,   "execve");
     patch("readlink",               (void*)hookReadlink, (void**)&origReadlink, "readlink");
+
+    // FORTIFY wrappers: only patch when they are distinct symbols, otherwise the
+    // two trampolines call each other and the guest dies of stack overflow.
+    void* o = sym("open");
+    void* o2 = sym("__open_2");
+    if (o2 && o2 != o) {
+        patch("__open_2", (void*)hookOpen2, (void**)&origOpen2, "open2");
+    } else {
+        nlogRaw("skip", "__open_2 aliases open");
+    }
+    void* oa = sym("openat");
+    void* oa2 = sym("__openat_2");
+    if (oa2 && oa2 != oa) {
+        patch("__openat_2", (void*)hookOpenat2, (void**)&origOpenat2, "openat2");
+    } else {
+        nlogRaw("skip", "__openat_2 aliases openat");
+    }
 
     nlogRaw("done", "hooks installed");
     HLOG("hardening installed for %s mode=%d fd=%d", g_pkg, g_mode, g_logFd);
