@@ -56,17 +56,10 @@ const char* guestPkg() {
 }
 
 // ---------------------------------------------------------------------------
-// native trace -> app's own external dir (no permissions, any API level)
+// trace ring buffer -> drained by Java (MediaStore log), no filesystem access
 // ---------------------------------------------------------------------------
-const char* logPath() {
-    static char p[256] = {0};
-    if (p[0]) return p;
-    const char* base = "/storage/emulated/0/Android/data/top.niunaijun.blackbox/files";
-    syscall(SYS_mkdirat, AT_FDCWD, "/storage/emulated/0/Android/data/top.niunaijun.blackbox", 0771);
-    syscall(SYS_mkdirat, AT_FDCWD, base, 0771);
-    snprintf(p, sizeof(p), "%s/harden.log", base);
-    return p;
-}
+std::string g_trace;
+std::atomic<int> g_budget{4000};
 
 void nlogRaw(const char* tag, const char* detail) {
     if (g_budget.fetch_sub(1) <= 0) return;
@@ -74,11 +67,8 @@ void nlogRaw(const char* tag, const char* detail) {
     int n = snprintf(line, sizeof(line), "[%d] %s %s\n", (int)getpid(), tag, detail);
     if (n <= 0) return;
     if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, logPath(),
-                          O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
-    if (fd < 0) return;
-    syscall(SYS_write, fd, line, (size_t)n);
-    syscall(SYS_close, fd);
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (g_trace.size() < 60000) g_trace.append(line, (size_t)n);
 }
 
 uint32_t fnv(const char* s) {
@@ -335,6 +325,17 @@ void patch(const char* name, void* replace, void** orig, const char* tag) {
 }
 
 } // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_top_niunaijun_blackbox_core_NativeCore_ofxDrainTrace(JNIEnv *env, jclass) {
+    std::string out;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        out.swap(g_trace);
+    }
+    if (out.empty()) return nullptr;
+    return env->NewStringUTF(out.c_str());
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(JNIEnv *env, jclass, jstring pkg) {
