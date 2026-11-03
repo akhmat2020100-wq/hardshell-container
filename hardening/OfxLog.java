@@ -36,6 +36,7 @@ public final class OfxLog {
     private static volatile boolean installed;
     private static volatile int fd = -1;
     private static volatile int cachedMode = -1;
+    private static volatile String modeSource = "default";
 
     private OfxLog() {
     }
@@ -65,7 +66,8 @@ public final class OfxLog {
                 + " sdk=" + Build.VERSION.SDK_INT
                 + " model=" + Build.MODEL
                 + " fd=" + logFd()
-                + " mode=" + mode());
+                + " mode=" + mode()
+                + " src=" + modeSource());
     }
 
     public static void log(String msg) {
@@ -136,21 +138,26 @@ public final class OfxLog {
     /**
      * Stealth bitmask: 1 props, 2 cmdline, 4 status, 8 maps, 16 root paths.
      * Read from /sdcard/Download/hardbox-mode.txt, so the layer can be bisected
-     * from the phone without a rebuild. Missing file = 31 (everything on).
+     * from the phone without a rebuild. Missing file = 0 = trace only, nothing
+     * modified: the first launch must prove the hooks themselves are harmless.
      */
     public static int mode() {
         int have = cachedMode;
         if (have >= 0) {
             return have;
         }
-        int m = 31;
+        int m = 0;
+        String src = "default";
         try {
             File f = new File(Environment.getExternalStoragePublicDirectory(
                     Environment.DIRECTORY_DOWNLOADS), "hardbox-mode.txt");
             if (!f.canRead()) {
                 Context c = ctx;
                 if (c != null) {
-                    f = new File(c.getFilesDir(), "hardbox-mode.txt");
+                    File g = new File(c.getFilesDir(), "hardbox-mode.txt");
+                    if (g.canRead()) {
+                        f = g;
+                    }
                 }
             }
             if (f.canRead()) {
@@ -159,15 +166,24 @@ public final class OfxLog {
                 r.close();
                 if (s != null) {
                     m = Integer.parseInt(s.trim());
+                    src = "file:" + f.getAbsolutePath();
                 }
+            } else {
+                src = "unreadable:" + f.getAbsolutePath();
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            src = "err:" + t;
         }
         if (m < 0) {
             m = 0;
         }
         cachedMode = m;
+        modeSource = src;
         return m;
+    }
+
+    public static String modeSource() {
+        return modeSource;
     }
 
     private static String processName() {
