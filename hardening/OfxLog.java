@@ -55,6 +55,8 @@ public final class OfxLog {
             Process.killProcess(Process.myPid());
         });
 
+        startDrain();
+
         write("boot pid=" + Process.myPid()
                 + " proc=" + processName()
                 + " sdk=" + Build.VERSION.SDK_INT
@@ -63,6 +65,28 @@ public final class OfxLog {
 
     public static void log(String msg) {
         write(msg);
+    }
+
+    /** Pulls the native stealth trace (if any) into the same file every 2s. */
+    private static void startDrain() {
+        Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                try {
+                    String s = top.niunaijun.blackbox.core.NativeCore.ofxDrainTrace();
+                    if (s != null && s.length() > 0) {
+                        write("--- native ---\n" + s.trim());
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }, "ofx-drain");
+        t.setDaemon(true);
+        t.start();
     }
 
     private static String processName() {
