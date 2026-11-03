@@ -315,7 +315,25 @@ void patch(const char* name, void* replace, void** orig) {
 
 } // namespace
 
+// The container host process must stay byte-identical to upstream: if a hook
+// misbehaves, the launcher dies before it can even draw. Hardening is only
+// installed inside guest processes (`top.niunaijun.blackbox:p0` etc), which is
+// where the anti-cheat actually runs anyway.
+static bool hostProcess() {
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return true; // fail closed: assume host, install nothing
+    char buf[256] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return true;
+    return strcmp(buf, "top.niunaijun.blackbox") == 0;
+}
+
 extern "C" void ofx_install_hardening() {
+    if (hostProcess()) {
+        HLOG("host process: hardening deferred to guest");
+        return;
+    }
     if (g_installed.exchange(true)) return;
 
     patch("__system_property_get", (void*)hookPropGet, (void**)&origPropGet);
@@ -326,10 +344,6 @@ extern "C" void ofx_install_hardening() {
     patch("open", (void*)hookOpen, (void**)&origOpen);
     patch("openat", (void*)hookOpenat, (void**)&origOpenat);
     patch("fopen", (void*)hookFopen, (void**)&origFopen);
-    patch("uname", (void*)hookUname, (void**)&origUname);
-    patch("readdir", (void*)hookReaddir, (void**)&origReaddir);
-    patch("execve", (void*)hookExecve, (void**)&origExecve);
-    patch("ptrace", (void*)hookPtrace, (void**)&origPtrace);
 
-    HLOG("hardening installed");
+    HLOG("hardening installed in guest");
 }
