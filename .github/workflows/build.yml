@@ -16,9 +16,10 @@ jobs:
           git clone --depth 1 https://github.com/JDKaintscared/BlackBox.git src
           cd src && git log -1 --oneline
 
-      - name: Apply instrumentation
+      - name: Apply instrumentation + stealth
         run: |
           cp hardening/OfxLog.java src/Bcore/src/main/java/top/niunaijun/blackbox/util/OfxLog.java
+          cp hardening/harden.cpp src/Bcore/src/main/cpp/harden.cpp
           python3 - <<'PY'
           import sys, pathlib
 
@@ -33,6 +34,39 @@ jobs:
                   sys.exit("anchor not found: " + tag)
               return s.replace(old, new, 1)
 
+          # ---------- native lib: add harden.cpp to the build ----------
+          p = "src/Bcore/src/main/cpp/Android.mk"
+          s = rd(p)
+          if "harden.cpp" not in s:
+              s = sub(s, "LOCAL_SRC_FILES := BoxCore.cpp \\\nhidden_api.cpp",
+                      "LOCAL_SRC_FILES := BoxCore.cpp \\\nharden.cpp \\\nhidden_api.cpp",
+                      "Android.mk src list")
+              wr(p, s)
+
+          # ---------- NativeCore: entry point for the stealth layer ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/NativeCore.java"
+          s = rd(p)
+          if "ofxSetGuestPackage" not in s:
+              s = sub(s, "    public static native boolean disableResourceLoading();",
+                      "    public static native boolean disableResourceLoading();\n"
+                      "\n"
+                      "    public static native void ofxSetGuestPackage(String pkg);",
+                      "NativeCore native decl")
+              wr(p, s)
+
+          # ---------- guest boot: hand the package name to native, install hooks ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "ofxSetGuestPackage" not in s:
+              s = sub(s, "            this.mAppConfig = appConfig;",
+                      "            this.mAppConfig = appConfig;\n"
+                      "            try {\n"
+                      "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName);\n"
+                      "            } catch (Throwable ignored) {\n"
+                      "            }",
+                      "initProcess stealth hook")
+              wr(p, s)
+
           # ---------- Bcore logger ----------
           # (copied above)
 
@@ -43,11 +77,6 @@ jobs:
               s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
                       "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
                       "LauncherActivity import")
-              s = sub(s, 'Slog.d(TAG, "Starting app launch in background thread");',
-                      'Slog.d(TAG, "Starting app launch in background thread");\n'
-                      '                OfxLog.log("launchAppAsync begin pkg=" + launchIntent.getPackage()'
-                      ' + " cmp=" + launchIntent.getComponent());',
-                      "LaunchActivity begin")
               s = sub(s, 'Slog.d(TAG, "App launch initiated successfully");',
                       'Slog.d(TAG, "App launch initiated successfully");\n'
                       '                OfxLog.log("launchAppAsync startActivity returned");',
@@ -155,13 +184,10 @@ jobs:
 
           print("patched ok")
           PY
-          grep -c "OfxLog" \
-            src/Bcore/src/main/java/top/niunaijun/blackbox/app/LauncherActivity.java \
-            src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/BProcessManagerService.java \
-            src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/am/ActivityStack.java \
-            src/Bcore/src/main/java/top/niunaijun/blackbox/proxy/ProxyContentProvider.java \
+          grep -c "ofxSetGuestPackage" \
             src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java \
-            src/app/src/main/java/top/niunaijun/blackboxa/app/App.kt
+            src/Bcore/src/main/java/top/niunaijun/blackbox/core/NativeCore.java
+          grep -c "harden.cpp" src/Bcore/src/main/cpp/Android.mk
 
       - uses: actions/setup-java@v4
         with:
