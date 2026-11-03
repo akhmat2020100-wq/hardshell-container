@@ -205,6 +205,42 @@ jobs:
                       "bind catch")
               wr(p, s)
 
+          # ---------- BActivityThread: pinpoint death before makeApplication ----------
+          # New log (mode 31) stops after bindApplication, with heartbeat to hb 8
+          # and no makeApplication / BIND FAILED / CRASH. That means the guest dies
+          # or hangs in handleBindApplication BEFORE makeApplication, in a section
+          # with no try/catch logging. Log every risky step so the next log shows
+          # the last step reached.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "bind step" not in s:
+              s = sub(s, "PackageInfo packageInfo = BlackBoxCore.getBPackageManager().getPackageInfo(packageName, PackageManager.GET_PROVIDERS, BActivityThread.getUserId());",
+                      'OfxLog.log("bind step getPackageInfo begin");\n'
+                      "        PackageInfo packageInfo = BlackBoxCore.getBPackageManager().getPackageInfo(packageName, PackageManager.GET_PROVIDERS, BActivityThread.getUserId());\n"
+                      '        OfxLog.log("bind step getPackageInfo done");',
+                      "bind step pkginfo")
+              s = sub(s, "Context packageContext = createPackageContext(applicationInfo);",
+                      '        OfxLog.log("bind step createPackageContext begin");\n'
+                      "        Context packageContext = createPackageContext(applicationInfo);\n"
+                      '        OfxLog.log("bind step createPackageContext done");',
+                      "bind step ctx")
+              s = sub(s, "VirtualRuntime.setupRuntime(processName, applicationInfo);",
+                      '        OfxLog.log("bind step setupRuntime begin");\n'
+                      "        VirtualRuntime.setupRuntime(processName, applicationInfo);\n"
+                      '        OfxLog.log("bind step setupRuntime done");',
+                      "bind step runtime")
+              s = sub(s, "NativeCore.init(Build.VERSION.SDK_INT);",
+                      '        OfxLog.log("bind step NativeCore.init begin sdk=" + Build.VERSION.SDK_INT);\n'
+                      "        NativeCore.init(Build.VERSION.SDK_INT);\n"
+                      '        OfxLog.log("bind step NativeCore.init done");',
+                      "bind step native")
+              s = sub(s, "IOCore.get().enableRedirect(packageContext);",
+                      '        OfxLog.log("bind step enableRedirect begin");\n'
+                      "        IOCore.get().enableRedirect(packageContext);\n"
+                      '        OfxLog.log("bind step enableRedirect done");',
+                      "bind step io")
+              wr(p, s)
+
           # ---------- Host app: install logger in every process ----------
           p = "src/app/src/main/java/top/niunaijun/blackboxa/app/App.kt"
           s = rd(p)
