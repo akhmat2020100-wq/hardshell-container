@@ -71,6 +71,10 @@ jobs:
               s = sub(s, "            this.mAppConfig = appConfig;",
                       "            this.mAppConfig = appConfig;\n"
                       "            try {\n"
+                      "                // Guest process never runs host App.kt, so install the logger here.\n"
+                      "                // Without this, OfxLog.ctx is null in the guest and all guest\n"
+                      "                // logs (and the native fd) are silently dropped.\n"
+                      "                try { top.niunaijun.blackbox.util.OfxLog.install(top.niunaijun.blackbox.BlackBoxCore.getContext()); } catch (Throwable ignored2) { }\n"
                       "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName,\n"
                       "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
                       "                        top.niunaijun.blackbox.util.OfxLog.mode());\n"
