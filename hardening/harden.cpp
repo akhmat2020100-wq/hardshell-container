@@ -612,6 +612,23 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxDrainTrace(JNIEnv *env, jclass) {
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_top_niunaijun_blackbox_core_NativeCore_ofxWriteLog(JNIEnv *env, jclass, jstring msg) {
+    if (!msg) return;
+    const char* c = env->GetStringUTFChars(msg, nullptr);
+    if (!c) return;
+    // Write straight to the already-open MediaStore fd, bypassing Java
+    // MediaStore re-opens and IOCore IO redirection. This is why Java logs
+    // after enableRedirect were lost: MediaStore re-open / redirected path
+    // went to the virtual dir, while the native fd still points at the host file.
+    if (g_logFd >= 0) {
+        char line[1024];
+        int n = snprintf(line, sizeof(line), "%d %s\n", (int)getpid(), c);
+        if (n > 0) rawWrite(line, (size_t)(n > (int)sizeof(line) - 1 ? sizeof(line) - 1 : n));
+    }
+    env->ReleaseStringUTFChars(msg, c);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         JNIEnv *env, jclass, jstring pkg, jint logFd, jint mode) {
     if (!pkg) return;
