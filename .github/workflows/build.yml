@@ -178,7 +178,13 @@ jobs:
               s = sub(s, "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);",
                       '                OfxLog.log("makeApplication begin " + packageName);\n'
                       "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);\n"
-                      '                OfxLog.log("makeApplication done " + (application != null));',
+                      '                OfxLog.log("makeApplication done " + (application != null));\n'
+                      "                try {\n"
+                      "                    android.content.pm.ApplicationInfo ai2 = (application == null) ? null : application.getApplicationInfo();\n"
+                      "                    OfxLog.log(\"id \" + (ai2 == null ? \"null\" : (\"src=\" + ai2.sourceDir + \" data=\" + ai2.dataDir + \" lib=\" + ai2.nativeLibraryDir + \" uid=\" + ai2.uid + \" myuid=\" + android.os.Process.myUid() + \" pkg=\" + ai2.packageName)));\n"
+                      "                } catch (Throwable t2) {\n"
+                      '                    OfxLog.log("id failed " + t2);\n'
+                      "                }",
                       "makeApplication log")
               s = sub(s, "            onBeforeApplicationOnCreate(packageName, processName, application);",
                       '            OfxLog.log("Application.onCreate begin " + application.getClass().getName());\n'
