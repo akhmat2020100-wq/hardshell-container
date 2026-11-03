@@ -14,8 +14,38 @@ jobs:
       - name: Clone upstream (BlackBox fork, modern NDK/AGP)
         run: |
           git clone --depth 1 https://github.com/JDKaintscared/BlackBox.git src
-          cd src
-          git log -1 --oneline
+          cd src && git log -1 --oneline
+
+      - name: Apply hardening layer
+        run: |
+          cp hardening/harden.cpp src/Bcore/src/main/cpp/harden.cpp
+          python3 - <<'PY'
+          import sys, pathlib
+
+          mk = pathlib.Path("src/Bcore/src/main/cpp/Android.mk")
+          s = mk.read_text()
+          if "harden.cpp" not in s:
+              old = "LOCAL_SRC_FILES := BoxCore.cpp \\"
+              if old not in s:
+                  sys.exit("Android.mk: anchor not found")
+              s = s.replace(old, "LOCAL_SRC_FILES := BoxCore.cpp \\\n    harden.cpp \\")
+              mk.write_text(s)
+
+          bc = pathlib.Path("src/Bcore/src/main/cpp/BoxCore.cpp")
+          s = bc.read_text()
+          if "ofx_install_hardening" not in s:
+              anchor = "void registerMethod(JNIEnv *jenv) {"
+              if anchor not in s:
+                  sys.exit("BoxCore.cpp: anchor not found")
+              s = s.replace(anchor, 'extern "C" void ofx_install_hardening();\n\n' + anchor)
+              call = "    registerMethod(env);\n    return JNI_VERSION_1_6;"
+              if call not in s:
+                  sys.exit("BoxCore.cpp: JNI_OnLoad anchor not found")
+              s = s.replace(call, "    registerMethod(env);\n    ofx_install_hardening();\n    return JNI_VERSION_1_6;")
+              bc.write_text(s)
+
+          print("patched:", "harden.cpp" in mk.read_text(), "ofx_install_hardening" in bc.read_text())
+          PY
 
       - uses: actions/setup-java@v4
         with:
