@@ -59,7 +59,6 @@ const char* guestPkg() {
 // trace ring buffer -> drained by Java (MediaStore log), no filesystem access
 // ---------------------------------------------------------------------------
 std::string g_trace;
-std::atomic<int> g_budget{4000};
 
 void nlogRaw(const char* tag, const char* detail) {
     if (g_budget.fetch_sub(1) <= 0) return;
