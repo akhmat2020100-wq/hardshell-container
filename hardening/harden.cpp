@@ -475,15 +475,28 @@ void replaceAll(std::string& s, const std::string& from, const std::string& to) 
 
 void rewritePaths(std::string& line) {
     static std::string app = std::string("/data/app/~~ofxQm9w==/") + guestPkg() + "-ofxQm9w==";
-    static std::string host1 = "/data/user/0/top.niunaijun.blackbox/files/blackbox/";
-    static std::string host2 = "/data/data/top.niunaijun.blackbox/files/blackbox/";
-    static std::string host3 = "/data/user/0/top.niunaijun.blackbox/";
-    static std::string host4 = "/data/data/top.niunaijun.blackbox/";
-    replaceAll(line, host1, app + "/");
-    replaceAll(line, host2, app + "/");
-    replaceAll(line, host3, app + "/");
-    replaceAll(line, host4, app + "/");
+
+    // Virtual storage is <hostData>/blackbox/data/user/<n>/<pkg>. Collapse it
+    // to what a real install shows, whatever the host package is named.
+    static const char* kVirtual = "/blackbox/data/user/";
+    size_t k = line.find(kVirtual);
+    if (k != std::string::npos) {
+        std::string tail = line.substr(k + strlen(kVirtual));
+        size_t slash = tail.find('/');
+        if (slash != std::string::npos) {
+            line = "/data/user/" + tail;
+        }
+    }
+    // Anything else under the container root is not a real app path.
+    static const char* kRoots[] = {
+        "/data/user/0/top.niunaijun.blackbox/files/blackbox/",
+        "/data/data/top.niunaijun.blackbox/files/blackbox/",
+        "/data/user/0/top.niunaijun.blackbox/",
+        "/data/data/top.niunaijun.blackbox/",
+    };
+    for (const char* r : kRoots) replaceAll(line, r, app + "/");
     replaceAll(line, "/files/blackbox/", "/");
+    replaceAll(line, "/blackbox/", "/");
     replaceAll(line, "top.niunaijun.blackbox", guestPkg());
 }
 
@@ -766,6 +779,12 @@ ssize_t hookReadlink(const char* p, char* buf, size_t n) {
     if (r > 0 && buf && marked(buf) && modeOn(M_MAPS)) {
         std::string s(buf, (size_t)r);
         rewritePaths(s);
+        if (marked(s.c_str())) {
+            // Still smells of the container after rewriting: pretend the fd
+            // was closed under us instead of handing over the tell.
+            errno = ENOENT;
+            return -1;
+        }
         size_t c = s.size() < n ? s.size() : n;
         memcpy(buf, s.data(), c);
         return (ssize_t)c;
