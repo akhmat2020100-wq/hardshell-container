@@ -297,6 +297,33 @@ public final class OfxLog {
         return modeSource;
     }
 
+    /**
+     * ContextCompat.fix normally makes the guest present the host package to
+     * binder (mBasePackageName / mOpPackageName / attribution). That is also
+     * the one string an SDK reads to learn it is inside a container.
+     * hardbox-identity.txt = "host" restores the old behaviour.
+     */
+    public static boolean identityHost() {
+        try {
+            File root = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS);
+            File f = new File(root, "hardbox-identity.txt");
+            if (!f.canRead()) {
+                f = new File(new File(root, "HardBox"), "hardbox-identity.txt");
+            }
+            if (!f.canRead()) {
+                return false;
+            }
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.FileReader(f));
+            String v = br.readLine();
+            br.close();
+            return v != null && v.trim().equalsIgnoreCase("host");
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /** android.app.ActivityThread.currentProcessName() via reflection. */
     public static String procName() {
         try {
