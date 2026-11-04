@@ -150,6 +150,51 @@ void trace(const char* tag, const char* s) {
     nlogRaw(tag, s);
 }
 
+// Resolve which .so contains an address, using /proc/self/maps read through a
+// raw syscall so the hook chain is never re-entered.
+const char* libOf(void* addr, char* out, size_t cap) {
+    if (cap == 0) return out;
+    out[0] = '\0';
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return out;
+    std::string data;
+    char buf[8192];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) data.append(buf, (size_t)n);
+    close(fd);
+    uintptr_t a = (uintptr_t)addr;
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t nl = data.find('\n', pos);
+        if (nl == std::string::npos) nl = data.size();
+        std::string line = data.substr(pos, nl - pos);
+        pos = nl + 1;
+        unsigned long s = 0, e = 0, off = 0, ino = 0;
+        char perms[8] = {0}, dev[16] = {0};
+        int pathoff = 0;
+        int got = sscanf(line.c_str(), "%lx-%lx %7s %lx %15s %lu %n",
+                         &s, &e, perms, &off, dev, &ino, &pathoff);
+        if (got >= 5 && a >= s && a < e) {
+            const char* p = line.c_str() + pathoff;
+            if (*p) {
+                strncpy(out, p, cap - 1);
+                out[cap - 1] = '\0';
+            }
+            return out;
+        }
+    }
+    return out;
+}
+
+void traceLib(const char* tag, const char* s, void* ret) {
+    if (!s || !firstTime(s)) return;
+    char lib[200];
+    libOf(ret, lib, sizeof(lib));
+    char b[512];
+    snprintf(b, sizeof(b), "%s @%s", s, lib[0] ? lib : "?");
+    nlogRaw(tag, b);
+}
+
 void emitLogLine(int prio, const char* tag, const char* msg) {
     if (!tag || !msg) return;
     if (strncmp(tag, "ofx-harden", 10) == 0) return;
@@ -609,17 +654,17 @@ int hookDlIterate(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) {
 
 int hookStat(const char* p, struct stat* b) {
     if (modeOn(M_ROOTPATHS) && hiddenPath(p)) { errno = ENOENT; return -1; }
-    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("stat", p);
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) traceLib("stat", p, __builtin_return_address(0));
     return origStat(p, b);
 }
 int hookLstat(const char* p, struct stat* b) {
     if (modeOn(M_ROOTPATHS) && hiddenPath(p)) { errno = ENOENT; return -1; }
-    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("lstat", p);
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) traceLib("lstat", p, __builtin_return_address(0));
     return origLstat(p, b);
 }
 int hookAccess(const char* p, int m) {
     if (modeOn(M_ROOTPATHS) && hiddenPath(p)) { errno = ENOENT; return -1; }
-    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("access", p);
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) traceLib("access", p, __builtin_return_address(0));
     return origAccess(p, m);
 }
 
@@ -634,7 +679,7 @@ bool scrubThisOpen(const char* p) {
 int hookOpen(const char* p, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
-    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("open", p);
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) traceLib("open", p, __builtin_return_address(0));
     if (scrubThisOpen(p)) {
         int fd = scrubbedOpen(p);
         if (fd >= 0) return fd;
@@ -648,7 +693,7 @@ int hookOpen(const char* p, int flags, ...) {
 int hookOpenat(int dirfd, const char* p, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
-    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("openat", p);
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) traceLib("openat", p, __builtin_return_address(0));
     if (scrubThisOpen(p)) {
         int fd = scrubbedOpen(p);
         if (fd >= 0) return fd;
@@ -662,7 +707,7 @@ int hookOpenat(int dirfd, const char* p, int flags, ...) {
 // FORTIFY variants: two arguments, no mode. Kept separate from open/openat so
 // the trampolines never point at each other (that used to recurse forever).
 int hookOpen2(const char* p, int flags) {
-    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("open2", p);
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) traceLib("open2", p, __builtin_return_address(0));
     if (scrubThisOpen(p)) {
         int fd = scrubbedOpen(p);
         if (fd >= 0) return fd;
@@ -674,7 +719,7 @@ int hookOpen2(const char* p, int flags) {
 }
 
 int hookOpenat2(int dirfd, const char* p, int flags) {
-    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("openat2", p);
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) traceLib("openat2", p, __builtin_return_address(0));
     if (scrubThisOpen(p)) {
         int fd = scrubbedOpen(p);
         if (fd >= 0) return fd;
@@ -686,7 +731,8 @@ int hookOpenat2(int dirfd, const char* p, int flags) {
 }
 
 FILE* hookFopen(const char* p, const char* mode) {
-    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("fopen", p);
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/")))
+        traceLib("fopen", p, __builtin_return_address(0));
     if (scrubThisOpen(p)) {
         int fd = scrubbedOpen(p);
         if (fd < 0) { errno = EACCES; return nullptr; }
@@ -716,7 +762,7 @@ int hookExecve(const char* path, char* const argv[], char* const envp[]) {
 
 ssize_t hookReadlink(const char* p, char* buf, size_t n) {
     ssize_t r = origReadlink ? origReadlink(p, buf, n) : -1;
-    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) trace("readlink", p);
+    if (p && (strstr(p, "/proc/") || strstr(p, "/sys/"))) traceLib("readlink", p, __builtin_return_address(0));
     if (r > 0 && buf && marked(buf) && modeOn(M_MAPS)) {
         std::string s(buf, (size_t)r);
         rewritePaths(s);
@@ -767,9 +813,12 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxWriteLog(JNIEnv *env, jclass, jst
     // after enableRedirect were lost: MediaStore re-open / redirected path
     // went to the virtual dir, while the native fd still points at the host file.
     if (g_logFd >= 0) {
-        char line[1024];
-        int n = snprintf(line, sizeof(line), "%d %s\n", (int)getpid(), c);
-        if (n > 0) rawWrite(line, (size_t)(n > (int)sizeof(line) - 1 ? sizeof(line) - 1 : n));
+        size_t len = strlen(c);
+        char pre[32];
+        int n = snprintf(pre, sizeof(pre), "%d ", (int)getpid());
+        if (n > 0) rawWrite(pre, (size_t)n);
+        rawWrite(c, len);
+        rawWrite("\n", 1);
     }
     env->ReleaseStringUTFChars(msg, c);
 }
