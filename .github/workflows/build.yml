@@ -496,6 +496,17 @@ jobs:
                       "IPackageManagerProxy name-for-uid")
               wr(p, s)
 
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "sanitizeHome" not in s:
+              s = sub(s, '                OfxLog.log("v9 APP diag failed " + t);\n            }',
+                      '                OfxLog.log("v9 APP diag failed " + t);\n'
+                      "            }\n"
+                      "            try { top.niunaijun.blackbox.util.OfxPatch.sanitizeHome(mInitialApplication); }\n"
+                      "            catch (Throwable ignored) { }",
+                      "home sanitize call")
+              wr(p, s)
+
           print("patched ok")
           PY
           grep -c "ofxSetGuestPackage" \
