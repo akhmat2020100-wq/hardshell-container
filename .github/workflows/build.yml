@@ -441,6 +441,61 @@ jobs:
                       "ContextCompat resolver pkg")
               wr(p, s)
 
+          # ---------- getNameForUid: the last place the host package leaks ----------
+          # getPackagesForUid is proxied, getNameForUid is not - so it lands on the
+          # real PackageManager and answers "top.niunaijun.blackbox" for our own uid.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/IPackageManagerProxy.java"
+          s = rd(p)
+          if "getNameForUid" not in s:
+              s = sub(s, "        addMethodHook(new XiaomiSecurityBypass());",
+                      "        addMethodHook(new XiaomiSecurityBypass());\n"
+                      "        addMethodHook(new GetNameForUid());\n"
+                      "        addMethodHook(new GetNamesForUids());",
+                      "IPackageManagerProxy register")
+              s = sub(s, '    @ProxyMethod("getInstallerPackageName")',
+                      '    @ProxyMethod("getNameForUid")\n'
+                      "    public static class GetNameForUid extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            int uid = MethodParameterUtils.toInt(args[0]);\n"
+                      "            String guest = BActivityThread.getAppPackageName();\n"
+                      "            try {\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("getNameForUid uid=" + uid\n'
+                      '                        + " self=" + android.os.Process.myUid()\n'
+                      '                        + " host=" + BlackBoxCore.getHostUid()\n'
+                      '                        + " guest=" + guest);\n'
+                      "            } catch (Throwable ignored) { }\n"
+                      "            if (guest != null && (uid == android.os.Process.myUid()\n"
+                      "                    || uid == BlackBoxCore.getHostUid())) {\n"
+                      "                return guest;\n"
+                      "            }\n"
+                      "            return method.invoke(who, args);\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("getNamesForUids")\n'
+                      "    public static class GetNamesForUids extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            String guest = BActivityThread.getAppPackageName();\n"
+                      "            int[] uids = (args != null && args.length > 0 && args[0] instanceof int[])\n"
+                      "                    ? (int[]) args[0] : null;\n"
+                      "            if (guest == null || uids == null) return method.invoke(who, args);\n"
+                      "            String[] out = new String[uids.length];\n"
+                      "            for (int i = 0; i < uids.length; i++) {\n"
+                      "                if (uids[i] == android.os.Process.myUid()\n"
+                      "                        || uids[i] == BlackBoxCore.getHostUid()) {\n"
+                      "                    out[i] = guest;\n"
+                      "                }\n"
+                      "            }\n"
+                      "            return out;\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("getInstallerPackageName")',
+                      "IPackageManagerProxy name-for-uid")
+              wr(p, s)
+
           print("patched ok")
           PY
           grep -c "ofxSetGuestPackage" \
