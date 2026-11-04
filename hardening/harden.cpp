@@ -29,6 +29,7 @@
 #include <android/log.h>
 #include <signal.h>
 #include <ucontext.h>
+#include <unwind.h>
 #include <pthread.h>
 #include <link.h>
 #include <sys/types.h>
@@ -72,6 +73,8 @@ enum {
     M_NMS       = 8192,   // block libnms.so + trace dlopen names
     M_DLTRACE   = 16384,  // trace dlopen names only, nothing blocked
     M_NOLOG     = 32768,  // do not mirror liblog into hardbox-log.txt
+    M_KILLTRACE = 65536,  // hook kill/tgkill/sigqueue, log the caller and its stack
+    M_NOKILL    = 131072, // ...and swallow a self-directed SIGKILL instead of dying
     H_PROP      = 128,
     H_OPEN      = 256,
     H_STAT      = 512,
@@ -89,6 +92,7 @@ int  g_logFd = -1;
 int  g_mode  = 0;
 int  g_guestUid = -1;
 char g_pkg[128] = {0};
+JavaVM* g_vm = nullptr;
 std::mutex g_mtx;
 std::string g_buf;
 
@@ -293,6 +297,135 @@ void* hookDlopenExt(const char* name, int flags, const void* info) {
         return nullptr;
     }
     return origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// kill: when the SDK decides the box is dirty it does not crash - it calls
+// android.os.Process.sendSignal(myPid, 9) and the process evaporates without a
+// single line of evidence. Catch the call, name the caller, keep the stack.
+// ---------------------------------------------------------------------------
+typedef int (*killFn)(pid_t, int);
+typedef int (*tgkillFn)(pid_t, pid_t, int);
+typedef int (*sigqueueFn)(pid_t, int, const union sigval);
+killFn origKill = nullptr;
+tgkillFn origTgkill = nullptr;
+sigqueueFn origSigqueue = nullptr;
+
+// A native stack only says "libart.so called kill". The Java stack says which
+// class decided we were a threat - so pull it out of the VM while we're still
+// alive to tell the story.
+void logJavaStack() {
+    if (!g_vm) return;
+    JNIEnv* env = nullptr;
+    if (g_vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return;
+    if (env->PushLocalFrame(96) != 0) return;
+    jclass tcls = env->FindClass("java/lang/Throwable");
+    if (tcls) {
+        jmethodID ctor = env->GetMethodID(tcls, "<init>", "()V");
+        jmethodID st = env->GetMethodID(tcls, "getStackTrace",
+                                        "()[Ljava/lang/StackTraceElement;");
+        if (ctor && st) {
+            jobject t = env->NewObject(tcls, ctor);
+            if (t) {
+                jobjectArray arr = (jobjectArray)env->CallObjectMethod(t, st);
+                if (arr) {
+                    jsize n = env->GetArrayLength(arr);
+                    for (jsize i = 0; i < n && i < 14; i++) {
+                        jobject el = env->GetObjectArrayElement(arr, i);
+                        if (!el) continue;
+                        jclass elc = env->GetObjectClass(el);
+                        jmethodID ts = elc ? env->GetMethodID(elc, "toString",
+                                                              "()Ljava/lang/String;") : nullptr;
+                        if (ts) {
+                            jstring s = (jstring)env->CallObjectMethod(el, ts);
+                            if (s) {
+                                const char* c = env->GetStringUTFChars(s, nullptr);
+                                if (c) {
+                                    char b[360];
+                                    snprintf(b, sizeof(b), "#%d %s", (int)i, c);
+                                    nlogRaw("javabt", b);
+                                    env->ReleaseStringUTFChars(s, c);
+                                }
+                                env->DeleteLocalRef(s);
+                            }
+                        }
+                        if (elc) env->DeleteLocalRef(elc);
+                        env->DeleteLocalRef(el);
+                    }
+                }
+            }
+        }
+    }
+    env->ExceptionClear();
+    env->PopLocalFrame(nullptr);
+}
+
+struct BtState {
+    int depth;
+};
+
+static _Unwind_Reason_Code btCb(struct _Unwind_Context* ctx, void* arg) {
+    BtState* st = (BtState*)arg;
+    uintptr_t pc = (uintptr_t)_Unwind_GetIP(ctx);
+    if (pc) {
+        char lib[200];
+        libOf((void*)pc, lib, sizeof(lib));
+        char b[280];
+        snprintf(b, sizeof(b), "#%d %p @%s", st->depth, (void*)pc, lib[0] ? lib : "?");
+        nlogRaw("killbt", b);
+    }
+    st->depth++;
+    return (st->depth >= 8) ? _URC_END_OF_STACK : _URC_NO_REASON;
+}
+
+__attribute__((noinline))
+void killTrace(const char* fn, pid_t pid, int sig) {
+    const bool self = (pid == getpid() || pid == 0);
+    // Only fatal signals and self-targets are interesting; a healthy process
+    // sends SIGCHLD/SIGTERM around all day and would drown the log.
+    if (!self && sig != SIGKILL && sig != SIGABRT) return;
+    char lib[200];
+    libOf(__builtin_return_address(0), lib, sizeof(lib));
+    char b[320];
+    snprintf(b, sizeof(b), "%s pid=%d sig=%d self=%d @%s", fn, (int)pid, sig,
+             self ? 1 : 0, lib[0] ? lib : "?");
+    nlogRaw("KILL", b);
+    if (self) {
+        logJavaStack();
+        BtState st = {0};
+        _Unwind_Backtrace(btCb, &st);
+    }
+}
+
+bool selfKill(pid_t pid, int sig) {
+    return (pid == getpid() || pid == 0) && sig == SIGKILL;
+}
+
+int hookKill(pid_t pid, int sig) {
+    killTrace("kill", pid, sig);
+    if (modeOn(M_NOKILL) && selfKill(pid, sig)) {
+        nlogRaw("killblock", "self SIGKILL swallowed");
+        return 0;
+    }
+    return origKill ? origKill(pid, sig) : -1;
+}
+
+int hookTgkill(pid_t tgid, pid_t tid, int sig) {
+    killTrace("tgkill", tgid, sig);
+    if (modeOn(M_NOKILL) && selfKill(tgid, sig)) {
+        nlogRaw("killblock", "self SIGKILL swallowed (tgkill)");
+        return 0;
+    }
+    return origTgkill ? origTgkill(tgid, tid, sig) : -1;
+}
+
+int hookSigqueue(pid_t pid, int sig, const union sigval val) {
+    killTrace("sigqueue", pid, sig);
+    if (modeOn(M_NOKILL) && selfKill(pid, sig)) {
+        nlogRaw("killblock", "self SIGKILL swallowed (sigqueue)");
+        return 0;
+    }
+    return origSigqueue ? origSigqueue(pid, sig, val) : -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +980,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         JNIEnv *env, jclass, jstring pkg, jint logFd, jint mode, jint uid) {
     if (!pkg) return;
+    env->GetJavaVM(&g_vm);
     const char* c = env->GetStringUTFChars(pkg, nullptr);
     if (!c) return;
     {
@@ -901,6 +1035,14 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         patch("android_dlopen_ext", (void*)hookDlopenExt, (void**)&origDlopenExt, "dlopenext");
     } else {
         nlogRaw("skip", "dlopen group");
+    }
+
+    if (modeOn(M_KILLTRACE) || modeOn(M_NOKILL)) {
+        patch("kill",     (void*)hookKill,     (void**)&origKill,     "kill");
+        patch("tgkill",   (void*)hookTgkill,   (void**)&origTgkill,   "tgkill");
+        patch("sigqueue", (void*)hookSigqueue, (void**)&origSigqueue, "sigqueue");
+    } else {
+        nlogRaw("skip", "kill group");
     }
 
     {
