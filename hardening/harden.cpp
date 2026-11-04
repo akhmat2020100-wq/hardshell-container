@@ -381,16 +381,16 @@ static _Unwind_Reason_Code btCb(struct _Unwind_Context* ctx, void* arg) {
 __attribute__((noinline))
 void killTrace(const char* fn, pid_t pid, int sig) {
     const bool self = (pid == getpid() || pid == 0);
-    // Only fatal signals and self-targets are interesting; a healthy process
-    // sends SIGCHLD/SIGTERM around all day and would drown the log.
-    if (!self && sig != SIGKILL && sig != SIGABRT) return;
+    // Only fatal signals matter; ART suspends threads with SIGRT signals all
+    // day and would bury the log in its own bookkeeping.
+    if (sig != SIGKILL && sig != SIGABRT) return;
     char lib[200];
     libOf(__builtin_return_address(0), lib, sizeof(lib));
     char b[320];
     snprintf(b, sizeof(b), "%s pid=%d sig=%d self=%d @%s", fn, (int)pid, sig,
              self ? 1 : 0, lib[0] ? lib : "?");
     nlogRaw("KILL", b);
-    if (self) {
+    if (self && sig == SIGKILL) {
         logJavaStack();
         BtState st = {0};
         _Unwind_Backtrace(btCb, &st);
