@@ -19,6 +19,7 @@ import java.io.StringWriter;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * Plain-text logger that lands in /sdcard/Download/hardbox-log.txt.
@@ -60,6 +61,7 @@ public final class OfxLog {
         });
 
         startDrain();
+        startWatchdog();
 
         write("boot pid=" + Process.myPid()
                 + " proc=" + processName()
@@ -94,6 +96,51 @@ public final class OfxLog {
         }, "ofx-drain");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * Guest boot can stall before any Java callback fires, so snapshot every
+     * thread a few times early in the process. The main thread's top frame is
+     * the call that never returned.
+     */
+    private static void startWatchdog() {
+        Thread t = new Thread(() -> {
+            long start = android.os.SystemClock.elapsedRealtime();
+            long[] at = {6000L, 12000L, 20000L, 32000L, 50000L};
+            for (long ms : at) {
+                long left = ms - (android.os.SystemClock.elapsedRealtime() - start);
+                if (left > 0) {
+                    try {
+                        Thread.sleep(left);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+                try {
+                    write("--- stacks @" + ms + "ms ---" + snapshot());
+                } catch (Throwable ignored) {
+                }
+            }
+        }, "ofx-watchdog");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static String snapshot() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            for (Map.Entry<Thread, StackTraceElement[]> e : Thread.getAllStackTraces().entrySet()) {
+                Thread th = e.getKey();
+                sb.append("\n\"").append(th.getName()).append("\" id=").append(th.getId())
+                        .append(" state=").append(th.getState());
+                for (StackTraceElement el : e.getValue()) {
+                    sb.append("\n    at ").append(el);
+                }
+            }
+        } catch (Throwable t) {
+            sb.append("\nsnapshot failed: ").append(t);
+        }
+        return sb.toString();
     }
 
     /**
@@ -149,8 +196,15 @@ public final class OfxLog {
         int m = 0;
         String src = "default";
         try {
-            File f = new File(Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_DOWNLOADS), "hardbox-mode.txt");
+            File root = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS);
+            File f = new File(root, "hardbox-mode.txt");
+            if (!f.canRead()) {
+                File hb = new File(new File(root, "HardBox"), "hardbox-mode.txt");
+                if (hb.canRead()) {
+                    f = hb;
+                }
+            }
             if (!f.canRead()) {
                 Context c = ctx;
                 if (c != null) {
