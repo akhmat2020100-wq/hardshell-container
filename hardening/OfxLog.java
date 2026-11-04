@@ -62,8 +62,10 @@ public final class OfxLog {
 
         startDrain();
         startWatchdog();
-        scheduleLogcat(8000);
-        scheduleLogcat(20000);
+        scheduleLogcat(1200);
+        scheduleLogcat(2500);
+        scheduleLogcat(4000);
+        scheduleLogcat(6000);
 
         write("boot pid=" + Process.myPid()
                 + " proc=" + processName()
@@ -176,7 +178,15 @@ public final class OfxLog {
                         || line.contains("il2cpp") || line.contains("EGL")
                         || line.contains("GLES") || line.contains("OpenGL")
                         || line.contains("ofx") || line.contains("catsbit")
-                        || line.contains("blackbox") || line.contains("DEBUG")) {
+                        || line.contains("blackbox") || line.contains("DEBUG")
+                        || line.contains("pgl") || line.contains("PGL")
+                        || line.contains("ssdk") || line.contains("SSDK")
+                        || line.contains("nms") || line.contains("NMS")
+                        || line.contains("Guard") || line.contains("guard")
+                        || line.contains("Threat") || line.contains("threat")
+                        || line.contains("Security") || line.contains("security")
+                        || line.contains("unisdk") || line.contains("UniSDK")
+                        || line.contains("anti") || line.contains("Anti")) {
                     sb.append(line).append('\n');
                 }
             }
@@ -285,6 +295,17 @@ public final class OfxLog {
 
     public static String modeSource() {
         return modeSource;
+    }
+
+    /** android.app.ActivityThread.currentProcessName() via reflection. */
+    public static String procName() {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object v = at.getMethod("currentProcessName").invoke(null);
+            return String.valueOf(v);
+        } catch (Throwable t) {
+            return "?" + t;
+        }
     }
 
     private static String processName() {
