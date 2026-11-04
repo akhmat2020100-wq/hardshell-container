@@ -498,13 +498,13 @@ jobs:
 
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
-          if "sanitizeHome" not in s:
+          if "OfxPatch.diagNames" not in s:
               s = sub(s, '                OfxLog.log("v9 APP diag failed " + t);\n            }',
                       '                OfxLog.log("v9 APP diag failed " + t);\n'
                       "            }\n"
-                      "            try { top.niunaijun.blackbox.util.OfxPatch.sanitizeHome(mInitialApplication); }\n"
+                      "            try { top.niunaijun.blackbox.util.OfxPatch.diagNames(mInitialApplication); }\n"
                       "            catch (Throwable ignored) { }",
-                      "home sanitize call")
+                      "identity names diag")
               wr(p, s)
 
           print("patched ok")
