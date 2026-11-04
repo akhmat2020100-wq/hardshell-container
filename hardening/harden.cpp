@@ -86,6 +86,9 @@ enum {
 std::atomic<bool> g_installed{false};
 std::atomic<int>  g_budget{30000};
 std::atomic<int>  g_lcatBudget{60000};
+// One-shot: the first time the SDK logs its package verdict, photograph the
+// stack that asked for it. Reading the client tells us nothing; the caller does.
+std::atomic<bool> g_pkgTrace{false};
 std::atomic<bool> g_hbStop{false};
 
 int  g_logFd = -1;
@@ -200,9 +203,16 @@ void traceLib(const char* tag, const char* s, void* ret) {
     nlogRaw(tag, b);
 }
 
+void logJavaStack();
+
 void emitLogLine(int prio, const char* tag, const char* msg) {
     if (!tag || !msg) return;
     if (strncmp(tag, "ofx-harden", 10) == 0) return;
+    // The SDK announces the verdict with the package name it decided we are.
+    // Whatever produced that string is the leak - trace it once, at the source.
+    if (strstr(msg, "getPackageName") && strstr(tag, "Kumiho") && !g_pkgTrace.exchange(true)) {
+        logJavaStack();
+    }
     if (g_lcatBudget.fetch_sub(1) <= 0) return;
     size_t n = strlen(msg);
     if (n > 300) n = 300;
