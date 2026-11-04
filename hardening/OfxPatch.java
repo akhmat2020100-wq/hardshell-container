@@ -12,11 +12,12 @@ import java.util.Locale;
  * Boot-time overrides for a single guest package, driven by a plain text file
  * on shared storage so the behaviour can be changed without rebuilding:
  *
+ *   /storage/emulated/0/Download/oxide-app.txt
  *   /storage/emulated/0/Download/HardBox/oxide-app.txt
  *
  *     default  replace the guest Application class with android.app.Application
  *     force    the same, plus makeApplication(forceDefaultAppClass = true)
- *     real     leave the class declared in the manifest untouched
+ *     real     leave the class reported by the package manager untouched
  *
  * Only the class name is touched. Paths, uid, abi and every other field of
  * ApplicationInfo stay exactly as the package manager produced them.
@@ -31,8 +32,13 @@ public final class OfxPatch {
     private static final String DEFAULT_APP_CLASS = "android.app.Application";
 
     private static volatile String cachedMode;
+    private static volatile String cachedSource = "default";
 
     private OfxPatch() {
+    }
+
+    public static String modeSource() {
+        return cachedSource;
     }
 
     /** Reads the mode once per process; every guest boots in its own process. */
@@ -42,27 +48,37 @@ public final class OfxPatch {
             return cached;
         }
         String mode = DEFAULT_MODE;
-        File dir = new File(Environment.getExternalStoragePublicDirectory(
-                Environment.DIRECTORY_DOWNLOADS), DIR_NAME);
-        File file = new File(dir, MODE_FILE);
-        try {
-            if (file.isFile()) {
-                BufferedReader reader = new BufferedReader(new FileReader(file));
+        String src = "default";
+        File root = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOWNLOADS);
+        File[] candidates = {
+                new File(root, MODE_FILE),
+                new File(new File(root, DIR_NAME), MODE_FILE)
+        };
+        for (File f : candidates) {
+            if (f == null || !f.isFile()) {
+                continue;
+            }
+            try {
+                BufferedReader reader = new BufferedReader(new FileReader(f));
                 try {
                     String line = reader.readLine();
                     if (line != null) {
                         line = line.trim().toLowerCase(Locale.ROOT);
                         if (line.length() > 0 && line.length() < 32) {
                             mode = line;
+                            src = f.getAbsolutePath();
                         }
                     }
                 } finally {
                     reader.close();
                 }
+                break;
+            } catch (Throwable ignored) {
             }
-        } catch (Throwable ignored) {
         }
         cachedMode = mode;
+        cachedSource = src;
         return mode;
     }
 
@@ -79,8 +95,8 @@ public final class OfxPatch {
             return info;
         }
         String mode = modeName();
-        OfxLog.log("appMode=" + mode + " pkg=" + packageName + " proc=" + processName
-                + " manifestClass=" + info.className);
+        OfxLog.log("appMode=" + mode + " src=" + cachedSource + " pkg=" + packageName
+                + " proc=" + processName + " manifestClass=" + info.className);
         if ("real".equals(mode)) {
             OfxLog.log("appMode keeps manifest Application");
             return info;
