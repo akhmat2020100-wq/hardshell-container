@@ -110,4 +110,93 @@ public final class OfxPatch {
     public static boolean forceDefault(String packageName) {
         return OXIDE_PKG.equals(packageName) && "force".equals(modeName());
     }
+
+    /** hardbox-home.txt on shared storage switches the home-path rewrite on. */
+    public static boolean homeEnabled() {
+        File root = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOWNLOADS);
+        File[] candidates = {
+                new File(root, "hardbox-home.txt"),
+                new File(new File(root, DIR_NAME), "hardbox-home.txt")
+        };
+        for (File f : candidates) {
+            if (f != null && f.isFile()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A sandbox gives itself away long before anyone reads /proc: the guest's
+     * own ApplicationInfo points at /data/user/0/top.niunaijun.blackbox/...
+     * and one substring check is enough. Report the path a real install would
+     * have; IOCore already redirects that path into the container, so file
+     * access keeps working.
+     */
+    public static void sanitizeHome(android.app.Application app) {
+        if (app == null || !homeEnabled()) {
+            return;
+        }
+        try {
+            String pkg = app.getPackageName();
+            if (pkg == null) {
+                return;
+            }
+            String real = "/data/user/0/" + pkg;
+            ApplicationInfo ai = app.getApplicationInfo();
+            if (ai != null) {
+                ai.dataDir = real;
+                ai.deviceProtectedDataDir = real;
+                ai.credentialProtectedDataDir = real;
+            }
+            Object base = app.getBaseContext();
+            Object loadedApk = null;
+            if (base != null) {
+                try {
+                    loadedApk = black.android.app.BRContextImpl.get(base).mPackageInfo();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (loadedApk != null) {
+                setField(loadedApk.getClass(), loadedApk, "mDataDirFile", new File(real));
+                setField(loadedApk.getClass(), loadedApk, "mCredentialProtectedDataDirFile", new File(real));
+                setField(loadedApk.getClass(), loadedApk, "mDeviceProtectedDataDirFile", new File(real));
+            }
+            if (base != null) {
+                Class<?> c = base.getClass();
+                while (c != null && !"android.app.ContextImpl".equals(c.getName())) {
+                    c = c.getSuperclass();
+                }
+                if (c != null) {
+                    String[] caches = {"mFilesDir", "mCacheDir", "mNoBackupFilesDir",
+                            "mCodeCacheDir", "mPreferencesDir"};
+                    for (String f : caches) {
+                        setField(c, base, f, null);
+                    }
+                }
+            }
+            OfxLog.log("home -> " + real + " ai=" + (ai != null)
+                    + " loadedApk=" + (loadedApk != null)
+                    + " files=" + app.getFilesDir());
+        } catch (Throwable t) {
+            OfxLog.log("home sanitize failed " + t);
+        }
+    }
+
+    private static void setField(Class<?> cls, Object target, String name, Object value) {
+        Class<?> c = cls;
+        while (c != null) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                f.set(target, value);
+                return;
+            } catch (NoSuchFieldException e) {
+                c = c.getSuperclass();
+            } catch (Throwable ignored) {
+                return;
+            }
+        }
+    }
 }
