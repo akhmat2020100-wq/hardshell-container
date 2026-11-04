@@ -68,6 +68,9 @@ enum {
     M_MAPS      = 8,
     M_ROOTPATHS = 16,
     M_NOHOOKS   = 64,
+    M_UID       = 4096,   // native getuid/geteuid -> guest app uid
+    M_NMS       = 8192,   // block libnms.so + trace dlopen names
+    M_NOLOG     = 32768,  // do not mirror liblog into hardbox-log.txt
     H_PROP      = 128,
     H_OPEN      = 256,
     H_STAT      = 512,
@@ -78,10 +81,12 @@ enum {
 
 std::atomic<bool> g_installed{false};
 std::atomic<int>  g_budget{30000};
+std::atomic<int>  g_lcatBudget{60000};
 std::atomic<bool> g_hbStop{false};
 
 int  g_logFd = -1;
 int  g_mode  = 0;
+int  g_guestUid = -1;
 char g_pkg[128] = {0};
 std::mutex g_mtx;
 std::string g_buf;
@@ -143,6 +148,105 @@ bool firstTime(const char* s) {
 void trace(const char* tag, const char* s) {
     if (!s || !firstTime(s)) return;
     nlogRaw(tag, s);
+}
+
+void emitLogLine(int prio, const char* tag, const char* msg) {
+    if (!tag || !msg) return;
+    if (strncmp(tag, "ofx-harden", 10) == 0) return;
+    if (g_lcatBudget.fetch_sub(1) <= 0) return;
+    size_t n = strlen(msg);
+    if (n > 300) n = 300;
+    char b[420];
+    int w = snprintf(b, sizeof(b), "%d log %c/%s: %.*s\n", (int)getpid(),
+                     "VDIWEFXX"[prio & 7], tag, (int)n, msg);
+    if (w > 0) rawWrite(b, (size_t)(w > (int)sizeof(b) - 1 ? sizeof(b) - 1 : w));
+}
+
+// ---------------------------------------------------------------------------
+// liblog mirror: the anti-cheat reports its own reasons through logd
+// ---------------------------------------------------------------------------
+typedef int (*logPrintFn)(int, const char*, const char*, ...);
+typedef int (*logWriteFn)(int, const char*, const char*);
+typedef int (*logVprintFn)(int, const char*, const char*, va_list);
+
+logPrintFn  origLogPrint  = nullptr;
+logWriteFn  origLogWrite  = nullptr;
+logVprintFn origLogVprint = nullptr;
+
+int hookLogWrite(int prio, const char* tag, const char* msg) {
+    emitLogLine(prio, tag, msg);
+    return origLogWrite ? origLogWrite(prio, tag, msg) : 0;
+}
+
+int hookLogPrint(int prio, const char* tag, const char* fmt, ...) {
+    if (!fmt) return 0;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    emitLogLine(prio, tag, buf);
+    return origLogWrite ? origLogWrite(prio, tag, buf) : 0;
+}
+
+int hookLogVprint(int prio, const char* tag, const char* fmt, va_list ap) {
+    if (!fmt) return 0;
+    char buf[512];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    emitLogLine(prio, tag, buf);
+    return origLogWrite ? origLogWrite(prio, tag, buf) : 0;
+}
+
+// ---------------------------------------------------------------------------
+// uid: Java Process.myUid() is already faked by the container, the raw libc
+// call is not. Any anti-cheat can compare the two.
+// ---------------------------------------------------------------------------
+typedef uid_t (*uidFn)(void);
+uidFn origGetuid = nullptr;
+uidFn origGeteuid = nullptr;
+
+uid_t hookGetuid() {
+    if (g_guestUid >= 0) return (uid_t)g_guestUid;
+    return origGetuid ? origGetuid() : (uid_t)-1;
+}
+
+uid_t hookGeteuid() {
+    if (g_guestUid >= 0) return (uid_t)g_guestUid;
+    return origGeteuid ? origGeteuid() : (uid_t)-1;
+}
+
+// ---------------------------------------------------------------------------
+// dlopen: see every library the guest pulls in, optionally refuse the
+// NetEase security module so the game has to continue without its verdict
+// ---------------------------------------------------------------------------
+typedef void* (*dlopenFn)(const char*, int);
+typedef void* (*dlopenExtFn)(const char*, int, const void*);
+dlopenFn origDlopen = nullptr;
+dlopenExtFn origDlopenExt = nullptr;
+
+bool nmsName(const char* n) {
+    if (!n) return false;
+    return strstr(n, "libnms.so") || strstr(n, "libpglarmor.so");
+}
+
+void* hookDlopen(const char* name, int flags) {
+    if (name) trace("dlopen", name);
+    if (modeOn(M_NMS) && nmsName(name)) {
+        nlogRaw("blocked", name);
+        errno = ENOENT;
+        return nullptr;
+    }
+    return origDlopen ? origDlopen(name, flags) : nullptr;
+}
+
+void* hookDlopenExt(const char* name, int flags, const void* info) {
+    if (name) trace("dlopen", name);
+    if (modeOn(M_NMS) && nmsName(name)) {
+        nlogRaw("blocked", name);
+        errno = ENOENT;
+        return nullptr;
+    }
+    return origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,9 +359,10 @@ const char* kHiddenProps[] = {
 };
 
 const char* kMarks[] = {
-    "blackbox", "sandbox", "sandhook", "virtualapp", "vspace", "xposed",
-    "magisk", "frida", "gum-js", "substrate", "lspd", "multiapp", "dualapp",
-    "parallel.", "dobby", "libxdl", "memfd:jit-cache",
+    "blackbox", "boxcore", "niunaijun", "sandhook", "virtualapp", "vspace",
+    "xposed", "edxposed", "riru", "zygisk", "magisk", "frida", "gum-js",
+    "substrate", "lspd", "multiapp", "dualapp", "parallel.", "dobby",
+    "libxdl", "memfd:jit-cache", "sandvxposed", "vapp",
 };
 
 bool marked(const char* s) {
@@ -361,6 +466,26 @@ std::string sanitize(const std::string& raw, const char* path) {
 
         if (statusMode && line.compare(0, 5, "Name:") == 0) {
             out += "Name:\t" + comm15() + "\n";
+            continue;
+        }
+        if (statusMode && line.compare(0, 4, "Uid:") == 0 && g_guestUid >= 0) {
+            char u[96];
+            snprintf(u, sizeof(u), "Uid:\t%d\t%d\t%d\t%d", g_guestUid, g_guestUid,
+                     g_guestUid, g_guestUid);
+            out += u;
+            out += '\n';
+            continue;
+        }
+        if (statusMode && line.compare(0, 4, "Gid:") == 0 && g_guestUid >= 0) {
+            char g[96];
+            snprintf(g, sizeof(g), "Gid:\t%d\t%d\t%d\t%d", g_guestUid, g_guestUid,
+                     g_guestUid, g_guestUid);
+            out += g;
+            out += '\n';
+            continue;
+        }
+        if (statusMode && line.compare(0, 10, "TracerPid:") == 0) {
+            out += "TracerPid:\t0\n";
             continue;
         }
         if (statMode) {
@@ -651,7 +776,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxWriteLog(JNIEnv *env, jclass, jst
 
 extern "C" JNIEXPORT void JNICALL
 Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
-        JNIEnv *env, jclass, jstring pkg, jint logFd, jint mode) {
+        JNIEnv *env, jclass, jstring pkg, jint logFd, jint mode, jint uid) {
     if (!pkg) return;
     const char* c = env->GetStringUTFChars(pkg, nullptr);
     if (!c) return;
@@ -661,13 +786,15 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         g_pkg[sizeof(g_pkg) - 1] = '\0';
         if (logFd >= 0) g_logFd = (int)dup(logFd);
         if (mode >= 0) g_mode = mode;
+        if (uid > 0) g_guestUid = (int)uid;
     }
     env->ReleaseStringUTFChars(pkg, c);
 
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "%s fd=%d mode=%d", g_pkg, g_logFd, g_mode);
+    snprintf(head, sizeof(head), "%s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+             g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
     installCrashHandler();
@@ -682,6 +809,30 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     }
 
     logSymbols();
+
+    // liblog mirror goes in before anything else: the first anti-cheat log
+    // line is worth more than every /proc trace combined.
+    if (!modeOn(M_NOLOG)) {
+        patch("__android_log_print",  (void*)hookLogPrint,  (void**)&origLogPrint,  "logprint");
+        patch("__android_log_write",  (void*)hookLogWrite,  (void**)&origLogWrite,  "logwrite");
+        patch("__android_log_vprint", (void*)hookLogVprint, (void**)&origLogVprint, "logvprint");
+    } else {
+        nlogRaw("skip", "liblog mirror");
+    }
+
+    if (modeOn(M_UID)) {
+        patch("getuid",  (void*)hookGetuid,  (void**)&origGetuid,  "getuid");
+        patch("geteuid", (void*)hookGeteuid, (void**)&origGeteuid, "geteuid");
+    } else {
+        nlogRaw("skip", "uid mask");
+    }
+
+    if (modeOn(M_NMS)) {
+        patch("dlopen",             (void*)hookDlopen,    (void**)&origDlopen,    "dlopen");
+        patch("android_dlopen_ext", (void*)hookDlopenExt, (void**)&origDlopenExt, "dlopenext");
+    } else {
+        nlogRaw("skip", "dlopen group");
+    }
 
     {
         char hb[128];
