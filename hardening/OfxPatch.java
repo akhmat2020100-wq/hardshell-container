@@ -115,6 +115,41 @@ public final class OfxPatch {
         return OXIDE_PKG.equals(packageName) && "force".equals(modeName());
     }
 
+    /**
+     * The SDK keeps announcing the host package even after the home path is
+     * fixed, so it is not reading dataDir. Print every "name" a process can
+     * hold at once and see which one still says top.niunaijun.blackbox.
+     */
+    public static void diagNames(android.app.Application app) {
+        if (app == null) {
+            return;
+        }
+        try {
+            ApplicationInfo ai = app.getApplicationInfo();
+            String cmd = "";
+            try {
+                BufferedReader r = new BufferedReader(new FileReader("/proc/self/cmdline"));
+                StringBuilder sb = new StringBuilder();
+                int c;
+                while ((c = r.read()) > 0) {
+                    sb.append((char) c);
+                }
+                r.close();
+                cmd = sb.toString();
+            } catch (Throwable ignored) {
+            }
+            OfxLog.log("names pkg=" + app.getPackageName()
+                    + " op=" + app.getOpPackageName()
+                    + " appProc=" + app.getProcessName()
+                    + " atProc=" + OfxLog.procName()
+                    + " aiProc=" + (ai == null ? "?" : ai.processName)
+                    + " uid=" + android.os.Process.myUid()
+                    + " cmdline=" + cmd);
+        } catch (Throwable t) {
+            OfxLog.log("names failed " + t);
+        }
+    }
+
     /** hardbox-home.txt on shared storage switches the home-path rewrite on. */
     public static boolean homeEnabled() {
         int cached = homeFlag;
