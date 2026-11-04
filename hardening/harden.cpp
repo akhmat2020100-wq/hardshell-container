@@ -503,7 +503,7 @@ void dumpDecryptedDex() {
                 }
 
                 // A clean dex header is worth more than a guess.
-                off = 0;
+                size_t off = 0;
                 while (idx < 12) {
                     const unsigned char* hit = (const unsigned char*)
                             memmem(p + off, scanLen - off, "dex\n0", 5);
