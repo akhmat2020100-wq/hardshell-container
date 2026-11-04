@@ -148,7 +148,6 @@ public final class OfxPatch {
             if (ai != null) {
                 ai.dataDir = real;
                 ai.deviceProtectedDataDir = real;
-                ai.credentialProtectedDataDir = real;
             }
             Object base = app.getBaseContext();
             Object loadedApk = null;
