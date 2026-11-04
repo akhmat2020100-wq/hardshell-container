@@ -166,7 +166,7 @@ public final class OfxLog {
     private static void dumpLogcat(long tag) {
         StringBuilder sb = new StringBuilder();
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{
+            java.lang.Process p = Runtime.getRuntime().exec(new String[]{
                     "/system/bin/logcat", "-d", "-v", "time", "-t", "4000"});
             java.io.BufferedReader r = new java.io.BufferedReader(
                     new java.io.InputStreamReader(p.getInputStream()));
