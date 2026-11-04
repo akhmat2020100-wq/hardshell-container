@@ -412,6 +412,35 @@ jobs:
                       "getPackagesForUid result diag")
               wr(p, s)
 
+          # ---------- identity: stop handing the host package to SDKs ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/utils/compat/ContextCompat.java"
+          s = rd(p)
+          if "ofxIdentityPkg" not in s:
+              s = sub(s, "public class ContextCompat {\n    public static final String TAG = \"ContextCompat\";",
+                      "public class ContextCompat {\n"
+                      "    public static final String TAG = \"ContextCompat\";\n"
+                      "    // set by fix(); null = keep the legacy host-package behaviour\n"
+                      "    public static String ofxIdentityPkg = null;",
+                      "ContextCompat identity field")
+              s = sub(s, "            AttributionSourceStateContext attributionSourceStateContext = BRAttributionSourceState.get(mAttributionSourceState);\n"
+                         "            attributionSourceStateContext._set_packageName(BlackBoxCore.getHostPkg());",
+                      "            AttributionSourceStateContext attributionSourceStateContext = BRAttributionSourceState.get(mAttributionSourceState);\n"
+                      "            attributionSourceStateContext._set_packageName(ofxIdentityPkg != null\n"
+                      "                    ? ofxIdentityPkg : BlackBoxCore.getHostPkg());",
+                      "ContextCompat attribution pkg")
+              s = sub(s, "            BRContextImpl.get(context)._set_mBasePackageName(BlackBoxCore.getHostPkg());\n"
+                         "            BRContextImplKitkat.get(context)._set_mOpPackageName(BlackBoxCore.getHostPkg());",
+                      "            String ofxId = top.niunaijun.blackbox.util.OfxLog.identityHost()\n"
+                      "                    ? BlackBoxCore.getHostPkg() : context.getPackageName();\n"
+                      "            ofxIdentityPkg = ofxId;\n"
+                      "            BRContextImpl.get(context)._set_mBasePackageName(ofxId);\n"
+                      "            BRContextImplKitkat.get(context)._set_mOpPackageName(ofxId);",
+                      "ContextCompat base/op pkg")
+              s = sub(s, "                BRContentResolver.get(context.getContentResolver())._set_mPackageName(BlackBoxCore.getHostPkg());",
+                      "                BRContentResolver.get(context.getContentResolver())._set_mPackageName(ofxId);",
+                      "ContextCompat resolver pkg")
+              wr(p, s)
+
           print("patched ok")
           PY
           grep -c "ofxSetGuestPackage" \
