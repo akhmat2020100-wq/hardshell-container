@@ -336,6 +336,82 @@ jobs:
                       "Welcome log")
               wr(p, s)
 
+          # ---------- IServiceConnection: survive the API 36/37 signature ----------
+          # The platform class shadows our AIDL copy, so Stub.onTransact dispatches
+          # connected(ComponentName, IBinder, IBinderSession, boolean) and blows up
+          # with AbstractMethodError on every service binding -> JNI FatalError.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/delegate/ServiceConnectionDelegate.java"
+          s = rd(p)
+          if "onTransact(int code" not in s:
+              s = sub(s,
+                      "    public void connected(ComponentName name, IBinder service, boolean dead) throws RemoteException {",
+                      "    @Override\n"
+                      "    public boolean onTransact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) throws RemoteException {\n"
+                      "        if (code == 1) {\n"
+                      "            try {\n"
+                      "                data.enforceInterface(\"android.app.IServiceConnection\");\n"
+                      "                ComponentName name = data.readInt() != 0\n"
+                      "                        ? ComponentName.CREATOR.createFromParcel(data) : null;\n"
+                      "                IBinder service = data.readStrongBinder();\n"
+                      "                boolean dead = false;\n"
+                      "                if (data.dataAvail() > 0) {\n"
+                      "                    try { data.readStrongBinder(); } catch (Throwable ignored) { }\n"
+                      "                    if (data.dataAvail() > 0) dead = data.readInt() != 0;\n"
+                      "                }\n"
+                      "                connected(name, service, dead);\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      "            return true;\n"
+                      "        }\n"
+                      "        try {\n"
+                      "            return super.onTransact(code, data, reply, flags);\n"
+                      "        } catch (Throwable ignored) {\n"
+                      "            return true;\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      "    public void connected(ComponentName name, IBinder service, boolean dead) throws RemoteException {",
+                      "ServiceConnectionDelegate onTransact")
+              wr(p, s)
+
+          # ---------- diagnostics: what identity does the guest actually see ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "APP pkg=" not in s:
+              s = sub(s, "            ContextCompat.fix(mInitialApplication);",
+                      "            ContextCompat.fix(mInitialApplication);\n"
+                      "            try {\n"
+                      '                OfxLog.log("v9 APP pkg=" + mInitialApplication.getPackageName()\n'
+                      '                        + " op=" + mInitialApplication.getOpPackageName()\n'
+                      '                        + " aipkg=" + mInitialApplication.getApplicationInfo().packageName\n'
+                      '                        + " dataDir=" + mInitialApplication.getApplicationInfo().dataDir\n'
+                      '                        + " files=" + mInitialApplication.getFilesDir()\n'
+                      '                        + " basepkg=" + (mInitialApplication.getBaseContext() == null\n'
+                      '                                ? "null" : mInitialApplication.getBaseContext().getPackageName()));\n'
+                      "            } catch (Throwable t) {\n"
+                      '                OfxLog.log("v9 APP diag failed " + t);\n'
+                      "            }",
+                      "APP identity diag")
+              wr(p, s)
+
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/pm/BPackageManagerService.java"
+          s = rd(p)
+          if "getPackagesForUid uid=" not in s:
+              s = sub(s,
+                      "    public String[] getPackagesForUid(int uid, int userId) throws RemoteException {\n"
+                      "        if (!sUserManager.exists(userId)) return new String[]{};",
+                      "    public String[] getPackagesForUid(int uid, int userId) throws RemoteException {\n"
+                      "        if (!sUserManager.exists(userId)) return new String[]{};\n"
+                      "        if (uid == android.os.Process.myUid())\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("getPackagesForUid uid=" + uid + " user=" + userId);',
+                      "getPackagesForUid diag")
+              s = sub(s, "            return packages.toArray(new String[]{});",
+                      "            String[] outArr = packages.toArray(new String[]{});\n"
+                      "            if (uid == android.os.Process.myUid())\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("getPackagesForUid -> " + java.util.Arrays.toString(outArr));\n'
+                      "            return outArr;",
+                      "getPackagesForUid result diag")
+              wr(p, s)
+
           print("patched ok")
           PY
           grep -c "ofxSetGuestPackage" \
