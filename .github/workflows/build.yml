@@ -61,7 +61,8 @@ jobs:
                       "\n"
                       "    public static native void ofxSetGuestPackage(String pkg, int logFd, int mode);\n"
                       "\n"
-                      "    public static native String ofxDrainTrace();",
+                      "    public static native String ofxDrainTrace();\n"
+                      "    public static native void ofxWriteLog(String line);",
                       "NativeCore native decl")
               wr(p, s)
 
