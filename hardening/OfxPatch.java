@@ -33,6 +33,7 @@ public final class OfxPatch {
 
     private static volatile String cachedMode;
     private static volatile String cachedSource = "default";
+    private static volatile int homeFlag = -1;
 
     private OfxPatch() {
     }
@@ -94,6 +95,9 @@ public final class OfxPatch {
         if (!OXIDE_PKG.equals(packageName)) {
             return info;
         }
+        // Primed here: by the time the app is created, IOCore has redirected
+        // /storage/emulated/0 into the container and the flag file is gone.
+        homeEnabled();
         String mode = modeName();
         OfxLog.log("appMode=" + mode + " src=" + cachedSource + " pkg=" + packageName
                 + " proc=" + processName + " manifestClass=" + info.className);
@@ -113,18 +117,28 @@ public final class OfxPatch {
 
     /** hardbox-home.txt on shared storage switches the home-path rewrite on. */
     public static boolean homeEnabled() {
-        File root = Environment.getExternalStoragePublicDirectory(
-                Environment.DIRECTORY_DOWNLOADS);
-        File[] candidates = {
-                new File(root, "hardbox-home.txt"),
-                new File(new File(root, DIR_NAME), "hardbox-home.txt")
-        };
-        for (File f : candidates) {
-            if (f != null && f.isFile()) {
-                return true;
-            }
+        int cached = homeFlag;
+        if (cached >= 0) {
+            return cached == 1;
         }
-        return false;
+        boolean on = false;
+        try {
+            File root = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS);
+            File[] candidates = {
+                    new File(root, "hardbox-home.txt"),
+                    new File(new File(root, DIR_NAME), "hardbox-home.txt")
+            };
+            for (File f : candidates) {
+                if (f != null && f.isFile()) {
+                    on = true;
+                    break;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        homeFlag = on ? 1 : 0;
+        return on;
     }
 
     /**
@@ -135,7 +149,11 @@ public final class OfxPatch {
      * access keeps working.
      */
     public static void sanitizeHome(android.app.Application app) {
-        if (app == null || !homeEnabled()) {
+        if (app == null) {
+            return;
+        }
+        if (!homeEnabled()) {
+            OfxLog.log("home off");
             return;
         }
         try {
@@ -177,7 +195,11 @@ public final class OfxPatch {
             }
             OfxLog.log("home -> " + real + " ai=" + (ai != null)
                     + " loadedApk=" + (loadedApk != null)
-                    + " files=" + app.getFilesDir());
+                    + " files=" + app.getFilesDir()
+                    + " cache=" + app.getCacheDir()
+                    + " dataDir=" + (ai == null ? "?" : ai.dataDir)
+                    + " libs=" + (ai == null ? "?" : ai.nativeLibraryDir)
+                    + " code=" + app.getPackageCodePath());
         } catch (Throwable t) {
             OfxLog.log("home sanitize failed " + t);
         }
