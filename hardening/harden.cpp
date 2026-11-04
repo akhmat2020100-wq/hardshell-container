@@ -465,48 +465,69 @@ void dumpDecryptedDex() {
     int idx = 0;
     int regions = 0;
     int hits = 0;
+    int needles = 0;
     size_t scanned = 0;
     char* line = mb;
-    while (line && *line && idx < 8 && scanned < (size_t)1536 * 1024 * 1024) {
+    while (line && *line && idx < 12) {
         char* nl = strchr(line, '\n');
         if (nl) *nl = 0;
-        unsigned long long s = 0, e = 0;
-        char perms[8] = {0};
-        char path[256] = {0};
-        int got = sscanf(line, "%llx-%llx %7s %*s %*s %*s %255s", &s, &e, perms, path);
-        if (got >= 3 && perms[0] == 'r' && e > s) {
-            size_t len = (size_t)(e - s);
-            if (len > (size_t)80 * 1024 * 1024) len = (size_t)80 * 1024 * 1024;
-            const unsigned char* p = (const unsigned char*)(uintptr_t)s;
-            regions++;
-            scanned += len;
-            for (size_t o = 0; o + 8 < len && idx < 8; o += 1024 * 1024) {
-                size_t chunk = len - o;
-                if (chunk > 1024 * 1024 + 8) chunk = 1024 * 1024 + 8;
-                for (size_t i = 0; i + 8 < chunk; i++) {
-                    const bool isDex = memcmp(p + o + i, "dex\n0", 5) == 0;
-                    const bool isCdex = memcmp(p + o + i, "cdex", 4) == 0;
-                    if (isDex || isCdex) {
-                        hits++;
-                        uint32_t fsz = 0;
-                        memcpy(&fsz, p + o + i + 0x20, 4);
-                        size_t avail = len - o - i;
-                        if (fsz > 0x1000 && fsz <= avail && fsz <= (uint32_t)(48 * 1024 * 1024)) {
-                            writeDump(dir, idx++, p + o + i, fsz);
-                        } else {
-                            size_t cap = avail < (size_t)(1024 * 1024) ? avail : (size_t)(1024 * 1024);
-                            writeDump(dir, idx++, p + o + i, cap);
-                        }
-                        break;
-                    }
+        char* dash = strchr(line, '-');
+        if (dash) {
+            unsigned long long s = strtoull(line, nullptr, 16);
+            unsigned long long e = strtoull(dash + 1, nullptr, 16);
+            char* sp = dash;
+            while (*sp && *sp != ' ') sp++;
+            while (*sp == ' ') sp++;
+            if (e > s && sp[0] == 'r') {
+                size_t len = (size_t)(e - s);
+                size_t scanLen = len;
+                if (scanLen > (size_t)256 * 1024 * 1024) scanLen = (size_t)256 * 1024 * 1024;
+                const unsigned char* p = (const unsigned char*)(uintptr_t)s;
+                regions++;
+                scanned += scanLen;
+
+                // The obfuscated class names are plain ASCII inside the dex.
+                // Find one and dump the window around it: enough to read the
+                // whole string table even if the dex header is unreadable.
+                size_t off = 0;
+                while (idx < 12) {
+                    const unsigned char* hit = (const unsigned char*)
+                            memmem(p + off, scanLen - off, "qnxUk1", 6);
+                    if (!hit) break;
+                    needles++;
+                    size_t pos = (size_t)(hit - p);
+                    size_t back = pos > (1u << 20) ? pos - (1u << 20) : 0;
+                    size_t wlen = scanLen - back;
+                    if (wlen > (4u << 20)) wlen = (4u << 20);
+                    writeDump(dir, idx++, p + back, wlen);
+                    off = pos + 6;
+                }
+
+                // A clean dex header is worth more than a guess.
+                off = 0;
+                while (idx < 12) {
+                    const unsigned char* hit = (const unsigned char*)
+                            memmem(p + off, scanLen - off, "dex\n0", 5);
+                    if (!hit) break;
+                    hits++;
+                    size_t pos = (size_t)(hit - p);
+                    uint32_t fsz = 0;
+                    if (pos + 0x24 <= scanLen) memcpy(&fsz, p + pos + 0x20, 4);
+                    size_t avail = scanLen - pos;
+                    size_t take = (fsz > 0x1000 && fsz <= avail &&
+                                   fsz <= (uint32_t)(48 * 1024 * 1024)) ? (size_t)fsz : avail;
+                    if (take > (size_t)(8 * 1024 * 1024)) take = (size_t)(4 * 1024 * 1024);
+                    writeDump(dir, idx++, p + pos, take);
+                    off = pos + 5;
                 }
             }
         }
         line = nl ? nl + 1 : nullptr;
     }
     free(mb);
-    char b[200];
-    snprintf(b, sizeof(b), "regions=%d hits=%d written=%d scanned=%zu", regions, hits, idx, scanned);
+    char b[220];
+    snprintf(b, sizeof(b), "regions=%d dex=%d qnx=%d written=%d scanned=%zu",
+             regions, hits, needles, idx, scanned);
     nlogRaw("DUMP", b);
 }
 
