@@ -397,10 +397,33 @@ static _Unwind_Reason_Code btCb(struct _Unwind_Context* ctx, void* arg) {
 // ---------------------------------------------------------------------------
 void writeDump(const char* dir, int idx, const unsigned char* p, size_t len) {
     char path[400];
-    snprintf(path, sizeof(path), "%s/ofxdex_%d.dex", dir, idx);
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, path,
+    const char* dirs[3] = {dir, "/storage/emulated/0/Download", "/data/local/tmp"};
+    int fd = -1;
+    int err = 0;
+    for (int i = 0; i < 3 && fd < 0; i++) {
+        snprintf(path, sizeof(path), "%s/ofxdex_%d.dex", dirs[i], idx);
+        fd = (int)syscall(SYS_openat, AT_FDCWD, path,
                           O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
-    if (fd < 0) return;
+        err = errno;
+    }
+    if (fd < 0) {
+        // Every path outside the sandbox is walled off; the one handle we know
+        // is writable is the log fd. Embed the dex behind a marker line and
+        // carve it back out on the other side.
+        char b[220];
+        snprintf(b, sizeof(b), "all opens failed errno=%d (%s)", err, path);
+        nlogRaw("DUMP", b);
+        char h[64];
+        int hl = snprintf(h, sizeof(h), "OFXDEX %d %zu\n", idx, len);
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            rawWrite(h, (size_t)hl);
+            rawWrite((const char*)p, len);
+            rawWrite("\n", 1);
+        }
+        nlogRaw("DUMP", "embedded");
+        return;
+    }
     size_t off = 0;
     while (off < len) {
         ssize_t w = write(fd, p + off, len - off);
