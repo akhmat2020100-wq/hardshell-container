@@ -62,6 +62,8 @@ public final class OfxLog {
 
         startDrain();
         startWatchdog();
+        scheduleLogcat(8000);
+        scheduleLogcat(20000);
 
         write("boot pid=" + Process.myPid()
                 + " proc=" + processName()
@@ -141,6 +143,51 @@ public final class OfxLog {
             sb.append("\nsnapshot failed: ").append(t);
         }
         return sb.toString();
+    }
+
+    /**
+     * Unity reports its native failures only through logd. The container runs
+     * under the same uid as the guest, so logcat -d from inside the process
+     * returns this process's own lines.
+     */
+    private static void scheduleLogcat(final long delayMs) {
+        Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(delayMs);
+            } catch (InterruptedException e) {
+                return;
+            }
+            dumpLogcat(delayMs);
+        }, "ofx-logcat-" + delayMs);
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static void dumpLogcat(long tag) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{
+                    "/system/bin/logcat", "-d", "-v", "time", "-t", "4000"});
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()));
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.contains("Unity") || line.contains("unity3d")
+                        || line.contains("il2cpp") || line.contains("EGL")
+                        || line.contains("GLES") || line.contains("OpenGL")
+                        || line.contains("ofx") || line.contains("catsbit")
+                        || line.contains("blackbox") || line.contains("DEBUG")) {
+                    sb.append(line).append('\n');
+                }
+            }
+            r.close();
+        } catch (Throwable t) {
+            sb.append("dump failed: ").append(t).append('\n');
+        }
+        if (sb.length() > 20000) {
+            sb.delete(0, sb.length() - 20000);
+        }
+        write("--- logcat @" + tag + "ms ---\n" + sb);
     }
 
     /**
