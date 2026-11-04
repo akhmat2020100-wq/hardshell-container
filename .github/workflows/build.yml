@@ -19,6 +19,7 @@ jobs:
       - name: Apply instrumentation + stealth
         run: |
           cp hardening/OfxLog.java src/Bcore/src/main/java/top/niunaijun/blackbox/util/OfxLog.java
+          cp hardening/OfxPatch.java src/Bcore/src/main/java/top/niunaijun/blackbox/util/OfxPatch.java
           cp hardening/harden.cpp src/Bcore/src/main/cpp/harden.cpp
           python3 - <<'PY'
           import sys, pathlib
@@ -54,13 +55,11 @@ jobs:
           # ---------- NativeCore: entry point for the stealth layer ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/NativeCore.java"
           s = rd(p)
-          if "ofxWriteLog" not in s:
+          if "ofxSetGuestPackage" not in s:
               s = sub(s, "    public static native boolean disableResourceLoading();",
                       "    public static native boolean disableResourceLoading();\n"
                       "\n"
                       "    public static native void ofxSetGuestPackage(String pkg, int logFd, int mode);\n"
-                      "\n"
-                      "    public static native void ofxWriteLog(String msg);\n"
                       "\n"
                       "    public static native String ofxDrainTrace();",
                       "NativeCore native decl")
@@ -69,19 +68,13 @@ jobs:
           # ---------- guest boot: hand the package name to native, install hooks ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
-          if "ofxGuestLoggerInstalled" not in s:
+          if "ofxSetGuestPackage" not in s:
               s = sub(s, "            this.mAppConfig = appConfig;",
                       "            this.mAppConfig = appConfig;\n"
                       "            try {\n"
-                      "                // Guest process never runs host App.kt, so install the logger here.\n"
-                      "                // Without this, OfxLog.ctx is null in the guest and all guest\n"
-                      "                // logs (and the native fd) are silently dropped.\n"
-                      "                // NOTE: hooks are NOT installed here anymore. The guest hangs in\n"
-                      "                // IOCore.enableRedirect (see bind step log) when our Dobby hooks\n"
-                      "                // are already on open/openat, conflicting with BlackBox IO hooks.\n"
-                      "                // Hooks are installed after enableRedirect, in handleBindApplication.\n"
-                      "                try { top.niunaijun.blackbox.util.OfxLog.install(top.niunaijun.blackbox.BlackBoxCore.getContext()); } catch (Throwable ignored2) { }\n"
-                      "                // ofxGuestLoggerInstalled marker\n"
+                      "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName,\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.mode());\n"
                       "            } catch (Throwable ignored) {\n"
                       "            }",
                       "initProcess stealth hook")
@@ -200,12 +193,6 @@ jobs:
                       "onCreate begin")
               s = sub(s, "            onAfterApplicationOnCreate(packageName, processName, application);",
                       "            onAfterApplicationOnCreate(packageName, processName, application);\n"
-                      "            try {\n"
-                      "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(packageName,\n"
-                      "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
-                      "                        top.niunaijun.blackbox.util.OfxLog.mode());\n"
-                      '                OfxLog.log("ofxAfterOnCreate hooks installed");\n'
-                      "            } catch (Throwable ignored4) { OfxLog.log(\"ofxAfterOnCreate failed \" + ignored4); }\n"
                       '            OfxLog.log("Application.onCreate done");',
                       "onCreate done")
               s = sub(s, '            Slog.e(TAG, "Critical error in handleBindApplication", e);',
@@ -215,96 +202,101 @@ jobs:
                       "bind catch")
               wr(p, s)
 
-          # ---------- BActivityThread: pinpoint death before makeApplication ----------
-          # New log (mode 31) stops after bindApplication, with heartbeat to hb 8
-          # and no makeApplication / BIND FAILED / CRASH. That means the guest dies
-          # or hangs in handleBindApplication BEFORE makeApplication, in a section
-          # with no try/catch logging. Log every risky step so the next log shows
-          # the last step reached.
+          # ---------- BActivityThread: step markers inside handleBindApplication ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
-          if "bind step" not in s:
-              s = sub(s, "PackageInfo packageInfo = BlackBoxCore.getBPackageManager().getPackageInfo(packageName, PackageManager.GET_PROVIDERS, BActivityThread.getUserId());",
-                      'OfxLog.log("bind step getPackageInfo begin");\n'
-                      "        PackageInfo packageInfo = BlackBoxCore.getBPackageManager().getPackageInfo(packageName, PackageManager.GET_PROVIDERS, BActivityThread.getUserId());\n"
-                      '        OfxLog.log("bind step getPackageInfo done");',
-                      "bind step pkginfo")
-              s = sub(s, "Context packageContext = createPackageContext(applicationInfo);",
-                      '        OfxLog.log("bind step createPackageContext begin");\n'
+          if "hBind start" not in s:
+              s = sub(s, "    public synchronized void handleBindApplication(String packageName, String processName) {",
+                      "    public synchronized void handleBindApplication(String packageName, String processName) {\n"
+                      '        OfxLog.log("hBind start " + packageName);',
+                      "hBind start")
+              s = sub(s, "        Object boundApplication = BRActivityThread.get(BlackBoxCore.mainThread()).mBoundApplication();",
+                      '        OfxLog.log("hBind packageInfo done");\n'
+                      "        Object boundApplication = BRActivityThread.get(BlackBoxCore.mainThread()).mBoundApplication();\n"
+                      '        OfxLog.log("hBind boundApplication done");',
+                      "hBind packageInfo")
+              s = sub(s, "        Context packageContext = createPackageContext(applicationInfo);",
+                      '        OfxLog.log("hBind createPackageContext begin");\n'
                       "        Context packageContext = createPackageContext(applicationInfo);\n"
-                      '        OfxLog.log("bind step createPackageContext done");',
-                      "bind step ctx")
-              s = sub(s, "VirtualRuntime.setupRuntime(processName, applicationInfo);",
-                      '        OfxLog.log("bind step setupRuntime begin");\n'
+                      '        OfxLog.log("hBind createPackageContext done");',
+                      "hBind packageContext")
+              s = sub(s, "            WebView.setDataDirectorySuffix(getUserId() + \":\" + packageName + \":\" + processName);",
+                      "            WebView.setDataDirectorySuffix(getUserId() + \":\" + packageName + \":\" + processName);\n"
+                      '            OfxLog.log("hBind webview done");',
+                      "hBind webview")
+              s = sub(s, "        VirtualRuntime.setupRuntime(processName, applicationInfo);",
+                      '        OfxLog.log("hBind setupRuntime begin");\n'
                       "        VirtualRuntime.setupRuntime(processName, applicationInfo);\n"
-                      '        OfxLog.log("bind step setupRuntime done");',
-                      "bind step runtime")
-              s = sub(s, "NativeCore.init(Build.VERSION.SDK_INT);",
-                      '        OfxLog.log("bind step NativeCore.init begin sdk=" + Build.VERSION.SDK_INT);\n'
+                      '        OfxLog.log("hBind setupRuntime done");',
+                      "hBind setupRuntime")
+              s = sub(s, "        NativeCore.init(Build.VERSION.SDK_INT);",
+                      '        OfxLog.log("hBind NativeCore.init begin");\n'
                       "        NativeCore.init(Build.VERSION.SDK_INT);\n"
-                      '        OfxLog.log("bind step NativeCore.init done");',
-                      "bind step native")
-              s = sub(s, "IOCore.get().enableRedirect(packageContext);",
-                      '        OfxLog.log("bind step enableRedirect begin");\n'
+                      '        OfxLog.log("hBind NativeCore.init done");',
+                      "hBind nativecore")
+              s = sub(s, "        IOCore.get().enableRedirect(packageContext);",
+                      '        OfxLog.log("hBind enableRedirect begin");\n'
                       "        IOCore.get().enableRedirect(packageContext);\n"
-                      '        OfxLog.log("bind step enableRedirect done");',
-                      "bind step io")
+                      '        OfxLog.log("hBind enableRedirect done");',
+                      "hBind iocore")
               wr(p, s)
 
-          # ---------- BActivityThread: DEFER hooks to after Application.onCreate ----------
-          # Mode 64 proves makeApplication + onCreate pass without hooks, and
-          # mode 31 hangs inside makeApplication with hooks. So hooks must NOT
-          # be active during Application loading. They are installed in
-          # onAfterApplicationOnCreate below, before any Activity / Unity code.
+          # ---------- AppInstrumentation: did the game's Activity even start? ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/delegate/AppInstrumentation.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.utils.HackAppUtils;",
+                      "import top.niunaijun.blackbox.utils.HackAppUtils;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "AppInstrumentation import")
+              s = sub(s, '        Log.d(TAG, "callActivityOnCreate: " + activity.getClass().getName());',
+                      '        Log.d(TAG, "callActivityOnCreate: " + activity.getClass().getName());\n'
+                      '        OfxLog.log("Activity.onCreate " + activity.getClass().getName());',
+                      "AppInstrumentation checkActivity")
+              s = sub(s, "    public Activity newActivity(ClassLoader cl, String className, Intent intent) throws InstantiationException, IllegalAccessException, ClassNotFoundException {",
+                      "    public Activity newActivity(ClassLoader cl, String className, Intent intent) throws InstantiationException, IllegalAccessException, ClassNotFoundException {\n"
+                      '        OfxLog.log("newActivity " + className);',
+                      "AppInstrumentation newActivity")
+              wr(p, s)
+
+          # ---------- Application override for the protected guest ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
-          if "ofxDeferredHooks" not in s:
-              s = sub(s, "IOCore.get().enableRedirect(packageContext);",
-                      "IOCore.get().enableRedirect(packageContext);\n"
-                      "        OfxLog.log(\"bind step enableRedirect done\");\n"
-                      "        OfxLog.log(\"ofxDeferredHooks: hooks deferred to onCreate done\");",
-                      "hooks deferred")
+          if "OfxPatch" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.util.OfxLog;",
+                      "import top.niunaijun.blackbox.util.OfxLog;\nimport top.niunaijun.blackbox.util.OfxPatch;",
+                      "BActivityThread OfxPatch import")
+              s = sub(s,
+                      "        ApplicationInfo applicationInfo = packageInfo.applicationInfo;\n"
+                      "        if (packageInfo.providers == null) {",
+                      "        ApplicationInfo applicationInfo = packageInfo.applicationInfo;\n"
+                      "        applicationInfo = OfxPatch.adjust(applicationInfo, packageName, processName);\n"
+                      "        packageInfo.applicationInfo = applicationInfo;\n"
+                      "        if (packageInfo.providers == null) {",
+                      "appInfo override")
+              s = sub(s,
+                      "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);",
+                      "                application = BRLoadedApk.get(loadedApk).makeApplication(OfxPatch.forceDefault(packageName), null);",
+                      "makeApplication force flag")
               wr(p, s)
 
-          # ---------- IOCore: pinpoint hang inside enableRedirect ----------
-          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/IOCore.java"
+          # ---------- Guest install: size and free space (the target is ~900 MB) ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/pm/installer/CopyExecutor.java"
           s = rd(p)
-          if "io step" not in s:
-              s = sub(s, "ApplicationInfo packageInfo = BlackBoxCore.getBPackageManager().getApplicationInfo(packageName, PackageManager.GET_META_DATA, BlackBoxCore.getUserId());",
-                      'top.niunaijun.blackbox.util.OfxLog.log("io step getAppInfo begin");\n'
-                      "            ApplicationInfo packageInfo = BlackBoxCore.getBPackageManager().getApplicationInfo(packageName, PackageManager.GET_META_DATA, BlackBoxCore.getUserId());\n"
-                      '            top.niunaijun.blackbox.util.OfxLog.log("io step getAppInfo done");',
-                      "io step appinfo")
-              s = sub(s, "proc(rule);",
-                      '            top.niunaijun.blackbox.util.OfxLog.log("io step proc begin");\n'
-                      "            proc(rule);\n"
-                      '            top.niunaijun.blackbox.util.OfxLog.log("io step proc done");',
-                      "io step proc")
-              s = sub(s, "for (String key : rule.keySet()) {",
-                      '        top.niunaijun.blackbox.util.OfxLog.log("io step addRedirect loop begin keys=" + rule.size());\n'
-                      "        for (String key : rule.keySet()) {",
-                      "io step loop begin")
-              s = sub(s, "NativeCore.enableIO();",
-                      '        top.niunaijun.blackbox.util.OfxLog.log("io step addRedirect loop done");\n'
-                      '        top.niunaijun.blackbox.util.OfxLog.log("io step enableIO begin");\n'
-                      "        NativeCore.enableIO();\n"
-                      '        top.niunaijun.blackbox.util.OfxLog.log("io step enableIO done");',
-                      "io step enableIO")
-              wr(p, s)
-
-          # ---------- BActivityThread: steps after redirect, before makeApplication ----------
-          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
-          s = rd(p)
-          if "bind step AppBindData" not in s:
-              s = sub(s, "AppBindData bindData = new AppBindData();",
-                      '        OfxLog.log("bind step AppBindData begin");\n'
-                      "        AppBindData bindData = new AppBindData();\n"
-                      '        OfxLog.log("bind step AppBindData done");',
-                      "bind step appbind")
-              s = sub(s, "if (BRNetworkSecurityConfigProvider.getRealClass() != null) {",
-                      '        OfxLog.log("bind step NetworkSecurity begin");\n'
-                      "        if (BRNetworkSecurityConfigProvider.getRealClass() != null) {",
-                      "bind step netsec")
+          if "OfxLog" not in s:
+              s = sub(s, "    public int exec(BPackageSettings ps, InstallOption option, int userId) {\n        try {",
+                      "    public int exec(BPackageSettings ps, InstallOption option, int userId) {\n"
+                      "        long t0 = android.os.SystemClock.elapsedRealtime();\n"
+                      '        top.niunaijun.blackbox.util.OfxLog.log("install start " + ps.pkg.packageName\n'
+                      "                + \" apk=\" + ps.pkg.baseCodePath\n"
+                      "                + \" size=\" + new File(ps.pkg.baseCodePath).length()\n"
+                      "                + \" free=\" + BEnvironment.getDataDir(ps.pkg.packageName, userId).getUsableSpace());\n"
+                      "        try {",
+                      "CopyExecutor start")
+              s = sub(s, "        return 0;\n    }\n}",
+                      "        top.niunaijun.blackbox.util.OfxLog.log(\"install ok \" + ps.pkg.packageName\n"
+                      "                + \" in \" + (android.os.SystemClock.elapsedRealtime() - t0) + \"ms\");\n"
+                      "        return 0;\n    }\n}",
+                      "CopyExecutor done")
               wr(p, s)
 
           # ---------- Host app: install logger in every process ----------
