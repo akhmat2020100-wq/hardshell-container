@@ -70,6 +70,7 @@ enum {
     M_NOHOOKS   = 64,
     M_UID       = 4096,   // native getuid/geteuid -> guest app uid
     M_NMS       = 8192,   // block libnms.so + trace dlopen names
+    M_DLTRACE   = 16384,  // trace dlopen names only, nothing blocked
     M_NOLOG     = 32768,  // do not mirror liblog into hardbox-log.txt
     H_PROP      = 128,
     H_OPEN      = 256,
@@ -895,7 +896,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         nlogRaw("skip", "uid mask");
     }
 
-    if (modeOn(M_NMS)) {
+    if (modeOn(M_NMS) || modeOn(M_DLTRACE)) {
         patch("dlopen",             (void*)hookDlopen,    (void**)&origDlopen,    "dlopen");
         patch("android_dlopen_ext", (void*)hookDlopenExt, (void**)&origDlopenExt, "dlopenext");
     } else {
