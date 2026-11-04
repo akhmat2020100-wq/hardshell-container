@@ -415,26 +415,33 @@ void writeDump(const char* dir, int idx, const unsigned char* p, size_t len) {
 
 void dumpDecryptedDex() {
     if (g_dexDump.exchange(true)) return;
+    nlogRaw("DUMP", "start");
     char dir[256] = {0};
     char link[64];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", g_logFd);
     ssize_t ln = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD, link, dir, sizeof(dir) - 1);
-    if (ln <= 0) return;
-    dir[ln] = 0;
-    char* slash = strrchr(dir, '/');
-    if (!slash) return;
-    *slash = 0;
+    if (ln > 0) {
+        dir[ln] = 0;
+        char* slash = strrchr(dir, '/');
+        if (slash) *slash = 0;
+    }
+    if (!dir[0]) {
+        snprintf(dir, sizeof(dir), "/storage/emulated/0/Download");
+    }
+    nlogRaw("DUMP", dir);
 
     int mfd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY | O_CLOEXEC);
-    if (mfd < 0) return;
-    char* mb = (char*)malloc(512 * 1024);
+    if (mfd < 0) { nlogRaw("DUMP", "maps open failed"); return; }
+    char* mb = (char*)malloc(1024 * 1024);
     if (!mb) { syscall(SYS_close, mfd); return; }
-    ssize_t mn = (ssize_t)syscall(SYS_read, mfd, mb, 512 * 1024 - 1);
+    ssize_t mn = (ssize_t)syscall(SYS_read, mfd, mb, 1024 * 1024 - 1);
     syscall(SYS_close, mfd);
-    if (mn <= 0) { free(mb); return; }
+    if (mn <= 0) { free(mb); nlogRaw("DUMP", "maps read failed"); return; }
     mb[mn] = 0;
 
     int idx = 0;
+    int regions = 0;
+    int hits = 0;
     size_t scanned = 0;
     char* line = mb;
     while (line && *line && idx < 8 && scanned < (size_t)1536 * 1024 * 1024) {
@@ -446,22 +453,28 @@ void dumpDecryptedDex() {
         int got = sscanf(line, "%llx-%llx %7s %*s %*s %*s %255s", &s, &e, perms, path);
         if (got >= 3 && perms[0] == 'r' && e > s) {
             size_t len = (size_t)(e - s);
-            if (len <= (size_t)80 * 1024 * 1024) {
-                const unsigned char* p = (const unsigned char*)(uintptr_t)s;
-                scanned += len;
-                for (size_t o = 0; o + 8 < len && idx < 8; o += 1024 * 1024) {
-                    size_t chunk = len - o;
-                    if (chunk > 1024 * 1024 + 8) chunk = 1024 * 1024 + 8;
-                    for (size_t i = 0; i + 8 < chunk; i++) {
-                        if (memcmp(p + o + i, "dex\n03", 6) == 0) {
-                            uint32_t fsz = 0;
-                            memcpy(&fsz, p + o + i + 0x20, 4);
-                            if (fsz > 0x1000 && fsz <= len - o - i &&
-                                    fsz <= (uint32_t)(48 * 1024 * 1024)) {
-                                writeDump(dir, idx++, p + o + i, fsz);
-                            }
-                            break;
+            if (len > (size_t)80 * 1024 * 1024) len = (size_t)80 * 1024 * 1024;
+            const unsigned char* p = (const unsigned char*)(uintptr_t)s;
+            regions++;
+            scanned += len;
+            for (size_t o = 0; o + 8 < len && idx < 8; o += 1024 * 1024) {
+                size_t chunk = len - o;
+                if (chunk > 1024 * 1024 + 8) chunk = 1024 * 1024 + 8;
+                for (size_t i = 0; i + 8 < chunk; i++) {
+                    const bool isDex = memcmp(p + o + i, "dex\n0", 5) == 0;
+                    const bool isCdex = memcmp(p + o + i, "cdex", 4) == 0;
+                    if (isDex || isCdex) {
+                        hits++;
+                        uint32_t fsz = 0;
+                        memcpy(&fsz, p + o + i + 0x20, 4);
+                        size_t avail = len - o - i;
+                        if (fsz > 0x1000 && fsz <= avail && fsz <= (uint32_t)(48 * 1024 * 1024)) {
+                            writeDump(dir, idx++, p + o + i, fsz);
+                        } else {
+                            size_t cap = avail < (size_t)(1024 * 1024) ? avail : (size_t)(1024 * 1024);
+                            writeDump(dir, idx++, p + o + i, cap);
                         }
+                        break;
                     }
                 }
             }
@@ -469,6 +482,9 @@ void dumpDecryptedDex() {
         line = nl ? nl + 1 : nullptr;
     }
     free(mb);
+    char b[200];
+    snprintf(b, sizeof(b), "regions=%d hits=%d written=%d scanned=%zu", regions, hits, idx, scanned);
+    nlogRaw("DUMP", b);
 }
 
 __attribute__((noinline))
