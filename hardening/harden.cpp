@@ -89,6 +89,7 @@ std::atomic<int>  g_lcatBudget{60000};
 // One-shot: the first time the SDK logs its package verdict, photograph the
 // stack that asked for it. Reading the client tells us nothing; the caller does.
 std::atomic<bool> g_pkgTrace{false};
+std::atomic<bool> g_dexDump{false};
 std::atomic<bool> g_hbStop{false};
 
 int  g_logFd = -1;
@@ -388,9 +389,90 @@ static _Unwind_Reason_Code btCb(struct _Unwind_Context* ctx, void* arg) {
     return (st->depth >= 8) ? _URC_END_OF_STACK : _URC_NO_REASON;
 }
 
+// ---------------------------------------------------------------------------
+// The verdict lives in a dex that is decrypted into memory, so it is nowhere
+// on disk and no string scan of the APK can reach it. Find the dex magic in
+// our own address space and write the whole thing out; the strings inside
+// spell out exactly what the check looks at.
+// ---------------------------------------------------------------------------
+void writeDump(const char* dir, int idx, const unsigned char* p, size_t len) {
+    char path[400];
+    snprintf(path, sizeof(path), "%s/ofxdex_%d.dex", dir, idx);
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, path,
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0) return;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, p + off, len - off);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    close(fd);
+    char b[420];
+    snprintf(b, sizeof(b), "%s len=%zu", path, len);
+    nlogRaw("DUMP", b);
+}
+
+void dumpDecryptedDex() {
+    if (g_dexDump.exchange(true)) return;
+    char dir[256] = {0};
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", g_logFd);
+    ssize_t ln = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD, link, dir, sizeof(dir) - 1);
+    if (ln <= 0) return;
+    dir[ln] = 0;
+    char* slash = strrchr(dir, '/');
+    if (!slash) return;
+    *slash = 0;
+
+    int mfd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (mfd < 0) return;
+    char* mb = (char*)malloc(512 * 1024);
+    if (!mb) { syscall(SYS_close, mfd); return; }
+    ssize_t mn = (ssize_t)syscall(SYS_read, mfd, mb, 512 * 1024 - 1);
+    syscall(SYS_close, mfd);
+    if (mn <= 0) { free(mb); return; }
+    mb[mn] = 0;
+
+    int idx = 0;
+    size_t scanned = 0;
+    char* line = mb;
+    while (line && *line && idx < 8 && scanned < (size_t)1536 * 1024 * 1024) {
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        unsigned long long s = 0, e = 0;
+        char perms[8] = {0};
+        char path[256] = {0};
+        int got = sscanf(line, "%llx-%llx %7s %*s %*s %*s %255s", &s, &e, perms, path);
+        if (got >= 3 && perms[0] == 'r' && e > s) {
+            size_t len = (size_t)(e - s);
+            if (len <= (size_t)80 * 1024 * 1024) {
+                const unsigned char* p = (const unsigned char*)(uintptr_t)s;
+                scanned += len;
+                for (size_t o = 0; o + 8 < len && idx < 8; o += 1024 * 1024) {
+                    size_t chunk = len - o;
+                    if (chunk > 1024 * 1024 + 8) chunk = 1024 * 1024 + 8;
+                    for (size_t i = 0; i + 8 < chunk; i++) {
+                        if (memcmp(p + o + i, "dex\n03", 6) == 0) {
+                            uint32_t fsz = 0;
+                            memcpy(&fsz, p + o + i + 0x20, 4);
+                            if (fsz > 0x1000 && fsz <= len - o - i &&
+                                    fsz <= (uint32_t)(48 * 1024 * 1024)) {
+                                writeDump(dir, idx++, p + o + i, fsz);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        line = nl ? nl + 1 : nullptr;
+    }
+    free(mb);
+}
+
 __attribute__((noinline))
-void killTrace(const char* fn, pid_t pid, int sig) {
-    const bool self = (pid == getpid() || pid == 0);
+void killTrace(const char* fn, pid_t pid, int sig) {    const bool self = (pid == getpid() || pid == 0);
     // Only fatal signals matter; ART suspends threads with SIGRT signals all
     // day and would bury the log in its own bookkeeping.
     if (sig != SIGKILL && sig != SIGABRT) return;
@@ -404,6 +486,7 @@ void killTrace(const char* fn, pid_t pid, int sig) {
         logJavaStack();
         BtState st = {0};
         _Unwind_Backtrace(btCb, &st);
+        dumpDecryptedDex();
     }
 }
 
