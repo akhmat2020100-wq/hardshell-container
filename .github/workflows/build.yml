@@ -59,7 +59,7 @@ jobs:
               s = sub(s, "    public static native boolean disableResourceLoading();",
                       "    public static native boolean disableResourceLoading();\n"
                       "\n"
-                      "    public static native void ofxSetGuestPackage(String pkg, int logFd, int mode);\n"
+                      "    public static native void ofxSetGuestPackage(String pkg, int logFd, int mode, int uid);\n"
                       "\n"
                       "    public static native String ofxDrainTrace();\n"
                       "    public static native void ofxWriteLog(String line);",
@@ -75,7 +75,8 @@ jobs:
                       "            try {\n"
                       "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName,\n"
                       "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
-                      "                        top.niunaijun.blackbox.util.OfxLog.mode());\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.mode(),\n"
+                      "                        android.os.Process.myUid());\n"
                       "            } catch (Throwable ignored) {\n"
                       "            }",
                       "initProcess stealth hook")
@@ -219,6 +220,18 @@ jobs:
               s = sub(s, "        Context packageContext = createPackageContext(applicationInfo);",
                       '        OfxLog.log("hBind createPackageContext begin");\n'
                       "        Context packageContext = createPackageContext(applicationInfo);\n"
+                      "        top.niunaijun.blackbox.util.OfxLog.install(packageContext);\n"
+                      "        try {\n"
+                      "            OfxLog.log(\"guest env data=\" + applicationInfo.dataDir\n"
+                      "                    + \" files=\" + packageContext.getFilesDir()\n"
+                      "                    + \" cache=\" + packageContext.getCacheDir()\n"
+                      "                    + \" nulib=\" + applicationInfo.nativeLibraryDir\n"
+                      "                    + \" uid=\" + android.os.Process.myUid()\n"
+                      "                    + \" uidAi=\" + applicationInfo.uid\n"
+                      "                    + \" proc=\" + OfxLog.procName());\n"
+                      "        } catch (Throwable t) {\n"
+                      '            OfxLog.log("guest env failed " + t);\n'
+                      "        }\n"
                       '        OfxLog.log("hBind createPackageContext done");',
                       "hBind packageContext")
               s = sub(s, "            WebView.setDataDirectorySuffix(getUserId() + \":\" + packageName + \":\" + processName);",
