@@ -486,21 +486,20 @@ void dumpDecryptedDex() {
                 regions++;
                 scanned += scanLen;
 
-                // The obfuscated class names are plain ASCII inside the dex.
-                // Find one and dump the window around it: enough to read the
-                // whole string table even if the dex header is unreadable.
-                size_t off = 0;
-                while (idx < 12) {
+                // Dex type descriptors keep the class name with slashes:
+                // "LqnxUk1/r0nZ31/...;". Our own log lines use dots, so this
+                // needle only fires inside the real dex string table.
+                {
                     const unsigned char* hit = (const unsigned char*)
-                            memmem(p + off, scanLen - off, "qnxUk1", 6);
-                    if (!hit) break;
-                    needles++;
-                    size_t pos = (size_t)(hit - p);
-                    size_t back = pos > (1u << 20) ? pos - (1u << 20) : 0;
-                    size_t wlen = scanLen - back;
-                    if (wlen > (4u << 20)) wlen = (4u << 20);
-                    writeDump(dir, idx++, p + back, wlen);
-                    off = pos + 6;
+                            memmem(p, scanLen, "LqnxUk1/", 8);
+                    if (hit) {
+                        needles++;
+                        size_t pos = (size_t)(hit - p);
+                        size_t back = pos > (6u << 20) ? pos - (6u << 20) : 0;
+                        size_t wlen = scanLen - back;
+                        if (wlen > (12u << 20)) wlen = (12u << 20);
+                        writeDump(dir, idx++, p + back, wlen);
+                    }
                 }
 
                 // A clean dex header is worth more than a guess.
