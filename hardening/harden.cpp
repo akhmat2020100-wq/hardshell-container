@@ -461,16 +461,22 @@ void dumpDecryptedDex() {
     syscall(SYS_close, mfd);
     if (mn <= 0) { free(mb); nlogRaw("DUMP", "maps read failed"); return; }
     mb[mn] = 0;
+    {
+        char first[120];
+        snprintf(first, sizeof(first), "%.100s", mb);
+        nlogRaw("DUMP", first);
+    }
 
     int idx = 0;
     int regions = 0;
-    int hits = 0;
     int needles = 0;
+    int lines = 0;
     size_t scanned = 0;
     char* line = mb;
-    while (line && *line && idx < 12) {
+    while (line && *line && idx < 10) {
         char* nl = strchr(line, '\n');
         if (nl) *nl = 0;
+        lines++;
         char* dash = strchr(line, '-');
         if (dash) {
             unsigned long long s = strtoull(line, nullptr, 16);
@@ -485,48 +491,24 @@ void dumpDecryptedDex() {
                 const unsigned char* p = (const unsigned char*)(uintptr_t)s;
                 regions++;
                 scanned += scanLen;
-
-                // Dex type descriptors keep the class name with slashes:
-                // "LqnxUk1/r0nZ31/...;". Our own log lines use dots, so this
-                // needle only fires inside the real dex string table.
-                {
-                    const unsigned char* hit = (const unsigned char*)
-                            memmem(p, scanLen, "LqnxUk1/", 8);
-                    if (hit) {
-                        needles++;
-                        size_t pos = (size_t)(hit - p);
-                        size_t back = pos > (6u << 20) ? pos - (6u << 20) : 0;
-                        size_t wlen = scanLen - back;
-                        if (wlen > (12u << 20)) wlen = (12u << 20);
-                        writeDump(dir, idx++, p + back, wlen);
-                    }
-                }
-
-                // A clean dex header is worth more than a guess.
-                size_t off = 0;
-                while (idx < 12) {
-                    const unsigned char* hit = (const unsigned char*)
-                            memmem(p + off, scanLen - off, "dex\n0", 5);
-                    if (!hit) break;
-                    hits++;
+                const unsigned char* hit = (const unsigned char*)
+                        memmem(p, scanLen, "LqnxUk1", 7);
+                if (hit) {
+                    needles++;
                     size_t pos = (size_t)(hit - p);
-                    uint32_t fsz = 0;
-                    if (pos + 0x24 <= scanLen) memcpy(&fsz, p + pos + 0x20, 4);
-                    size_t avail = scanLen - pos;
-                    size_t take = (fsz > 0x1000 && fsz <= avail &&
-                                   fsz <= (uint32_t)(48 * 1024 * 1024)) ? (size_t)fsz : avail;
-                    if (take > (size_t)(8 * 1024 * 1024)) take = (size_t)(4 * 1024 * 1024);
-                    writeDump(dir, idx++, p + pos, take);
-                    off = pos + 5;
+                    size_t back = pos > (8u << 20) ? pos - (8u << 20) : 0;
+                    size_t wlen = scanLen - back;
+                    if (wlen > (16u << 20)) wlen = (16u << 20);
+                    writeDump(dir, idx++, p + back, wlen);
                 }
             }
         }
         line = nl ? nl + 1 : nullptr;
     }
     free(mb);
-    char b[220];
-    snprintf(b, sizeof(b), "regions=%d dex=%d qnx=%d written=%d scanned=%zu",
-             regions, hits, needles, idx, scanned);
+    char b[240];
+    snprintf(b, sizeof(b), "lines=%d regions=%d qnx=%d written=%d scanned=%zu",
+             lines, regions, needles, idx, scanned);
     nlogRaw("DUMP", b);
 }
 
