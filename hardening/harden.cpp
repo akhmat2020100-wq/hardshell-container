@@ -39,6 +39,10 @@
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
 #include <sys/utsname.h>
+#include <sys/prctl.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -46,6 +50,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
@@ -81,6 +86,7 @@ enum {
     M_NOEXIT    = 262144, // swallow self exit()/_exit(), the verdict's second act
     M_PROPTRACE = 524288, // log every ro.* property and prop_info the guest asks for
     M_SYS       = 1048576,// trace libc syscall() calls made by the packer library
+    M_SECCOMP   = 2097152,// seccomp-BPF: trap inline `svc` process/thread kills
     H_PROP      = 128,
     H_OPEN      = 256,
     H_STAT      = 512,
@@ -533,6 +539,29 @@ static _Unwind_Reason_Code btCb(struct _Unwind_Context* ctx, void* arg) {
 }
 
 // ---------------------------------------------------------------------------
+// pthread_exit: the quiet way out.
+//
+// A thread that vanishes while the process lives can also end itself:  return
+// from its start routine, or call pthread_exit directly. Unity's render thread
+// leaves nativeRender and the pthread trampoline fires pthread_exit. Hook it
+// and the log finally names the thread and the stack that ended it.
+// ---------------------------------------------------------------------------
+typedef void (*pthreadExitFn)(void*);
+pthreadExitFn origPthreadExit = nullptr;
+
+void hookPthreadExit(void* retval) {
+    char lib[140];
+    libOf(__builtin_return_address(0), lib, sizeof(lib));
+    char b[220];
+    snprintf(b, sizeof(b), "pthread_exit retval=%p @%s", retval,
+             lib[0] ? lib : "?");
+    nlogCrit("THREXIT", b);
+    BtState st = {0};
+    _Unwind_Backtrace(btCb, &st);
+    if (origPthreadExit) origPthreadExit(retval);
+}
+
+// ---------------------------------------------------------------------------
 // The verdict lives in a dex that is decrypted into memory, so it is nowhere
 // on disk and no string scan of the APK can reach it. Find the dex magic in
 // our own address space and write the whole thing out; the strings inside
@@ -962,12 +991,16 @@ void dumpDecryptedDex() {
 }
 
 __attribute__((noinline))
-void killTrace(const char* fn, pid_t pid, int sig) {    const bool self = (pid == getpid() || pid == 0);
-    // Only fatal signals matter; ART suspends threads with SIGRT signals all
-    // day and would bury the log in its own bookkeeping.
-    if (sig != SIGKILL && sig != SIGABRT) return;
+void killTrace(const char* fn, pid_t pid, int sig) {
+    const bool self = (pid == getpid() || pid == 0);
     char lib[200];
     libOf(__builtin_return_address(0), lib, sizeof(lib));
+    const bool fromLoader = strstr(lib, "libloader") != nullptr;
+
+    // ART cycles threads with SIGURG/SIGSTOP all day long; those stay quiet
+    // unless the packer library itself is the caller, which never happens by
+    // accident. SIGKILL/SIGABRT always get a line.
+    if (sig != SIGKILL && sig != SIGABRT && !fromLoader) return;
     char b[320];
     snprintf(b, sizeof(b), "%s pid=%d sig=%d self=%d @%s", fn, (int)pid, sig,
              self ? 1 : 0, lib[0] ? lib : "?");
@@ -1079,6 +1112,196 @@ void installCrashHandler() {
     sigemptyset(&sa.sa_mask);
     int sigs[] = {SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
     for (int s : sigs) sigaction(s, &sa, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// seccomp: the one hook that sees an inline `svc #0`.
+//
+// A thread that dies while the whole process keeps running is the signature of
+// tgkill(tgid=self, tid=target, SIGKILL). SIGKILL addressed to a single tid
+// kills only that thread. Every libc wrapper in this file stays silent for it,
+// because the packer loads x8 and issues `svc` directly. seccomp-BPF runs below
+// libc, so the filter sees it anyway.
+//
+// The filter is argument-scoped: only the fatals trap, so ART's constant
+// SIGURG/SIGSTOP thread bookkeeping (also tgkill) passes through untouched.
+//   tgkill(tgid, tid, SIGKILL)
+//   kill(pid, SIGKILL)
+//   exit_group(status) / exit(status)
+// The handler logs the trap and returns -EPERM from the syscall. The thread
+// lives, the process lives, and the log names the exact call.
+// ---------------------------------------------------------------------------
+std::atomic<int> g_seccompArmed{0};
+
+void sigSysHandler(int sig, siginfo_t* si, void* uc) {
+    (void)sig;
+    const int nr = si ? si->si_syscall : -1;
+    ucontext_t* u = (ucontext_t*)uc;
+#if defined(__aarch64__)
+    if (u) {
+        unsigned long long* r = (unsigned long long*)u->uc_mcontext.regs;
+        char b[200];
+        snprintf(b, sizeof(b), "trap nr=%d a0=%llu a1=%llu a2=%llu self=%d",
+                 nr, r[0], r[1], r[2], (int)getpid());
+        nlogRaw("SECCOMP", b);
+        r[0] = (unsigned long long)(long long)-EPERM;
+        return;
+    }
+#elif defined(__arm__)
+    if (u) {
+        char b[200];
+        snprintf(b, sizeof(b), "trap nr=%d a0=%lu a1=%lu a2=%lu self=%d",
+                 nr, (unsigned long)u->uc_mcontext.arm_r0,
+                 (unsigned long)u->uc_mcontext.arm_r1,
+                 (unsigned long)u->uc_mcontext.arm_r2, (int)getpid());
+        nlogRaw("SECCOMP", b);
+        u->uc_mcontext.arm_r0 = (unsigned long)(int)-EPERM;
+        return;
+    }
+#endif
+    // Not a seccomp trap: give SIGSYS back to the default action.
+    signal(SIGSYS, SIG_DFL);
+    raise(SIGSYS);
+}
+
+int installSeccomp() {
+#if defined(__aarch64__)
+    const uint32_t kArch = AUDIT_ARCH_AARCH64;
+#elif defined(__arm__)
+    const uint32_t kArch = AUDIT_ARCH_ARM;
+#else
+    return -1;
+#endif
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigSysHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSYS, &sa, nullptr) != 0) {
+        nlogCrit("SECCOMP", "sigaction(SIGSYS) failed");
+        return -1;
+    }
+
+    // 0  load arch
+    // 1  arch == ours ? -> 3 : -> 2
+    // 2  ALLOW
+    // 3  load nr
+    // 4  nr == exit_group ? -> 23 : fall through
+    // 5  nr == exit       ? -> 24 : fall through
+    // 6  nr == kill       ? -> 9  : fall through
+    // 7  nr == tgkill     ? -> 16 : fall through
+    // 8  ALLOW
+    // 9  kill:   load args[0] (pid)
+    // 10 pid == self ? -> 12 : -> 11
+    // 11 ALLOW
+    // 12 kill:   load args[1] (sig)
+    // 13 sig == SIGKILL ? -> 15 : -> 14
+    // 14 ALLOW
+    // 15 TRAP
+    // 16 tgkill: load args[0] (tgid)
+    // 17 tgid == self ? -> 19 : -> 18
+    // 18 ALLOW
+    // 19 tgkill: load args[2] (sig)
+    // 20 sig == SIGKILL ? -> 22 : -> 21
+    // 21 ALLOW
+    // 22 TRAP
+    // 23 TRAP (exit_group)
+    // 24 TRAP (exit)
+    std::vector<struct sock_filter> p;
+    auto put = [&](uint16_t code, uint32_t k) {
+        struct sock_filter ins;
+        memset(&ins, 0, sizeof(ins));
+        ins.code = code; ins.k = k;
+        p.push_back(ins);
+        return (int)p.size() - 1;
+    };
+    auto branch = [&](uint16_t cmp, uint32_t k) {
+        struct sock_filter ins;
+        memset(&ins, 0, sizeof(ins));
+        ins.code = (uint16_t)(BPF_JMP | cmp); ins.k = k;
+        p.push_back(ins);
+        return (int)p.size() - 1;
+    };
+    auto fix = [&](int at, int target, bool onTrue) {
+        int d = target - at - 1;
+        if (d < 0 || d > 255) { nlogCrit("SECCOMP", "branch out of range"); return; }
+        if (onTrue) p[at].jt = (uint8_t)d;
+        else        p[at].jf = (uint8_t)d;
+    };
+
+    const uint32_t self = (uint32_t)getpid();
+
+    put(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
+    const int jArch   = branch(BPF_JEQ | BPF_K, kArch);
+    const int iAllow0 = put(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    put(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
+    const int jEg     = branch(BPF_JEQ | BPF_K, __NR_exit_group);
+    const int jEx     = branch(BPF_JEQ | BPF_K, __NR_exit);
+    const int jKill   = branch(BPF_JEQ | BPF_K, __NR_kill);
+    const int jTg     = branch(BPF_JEQ | BPF_K, __NR_tgkill);
+    const int iAllow1 = put(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+
+    put(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
+    const int jKillPid = branch(BPF_JEQ | BPF_K, self);
+    const int iAllowK0 = put(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    put(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1]));
+    const int jKillSig = branch(BPF_JEQ | BPF_K, SIGKILL);
+    const int iAllowK1 = put(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    const int iTrapK   = put(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+
+    put(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
+    const int jTgTgid  = branch(BPF_JEQ | BPF_K, self);
+    const int iAllowT0 = put(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    put(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[2]));
+    const int jTgSig   = branch(BPF_JEQ | BPF_K, SIGKILL);
+    const int iAllowT1 = put(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    const int iTrapT   = put(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+
+    const int iTrapEg  = put(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+    const int iTrapEx  = put(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+
+    (void)iAllow0; (void)iAllow1; (void)iAllowK0; (void)iAllowK1;
+    (void)iAllowT0; (void)iAllowT1;
+
+    fix(jArch, jEg, true);
+    fix(jArch, iAllow0, false);
+    fix(jEg, iTrapEg, true);
+    fix(jEg, jEx, false);
+    fix(jEx, iTrapEx, true);
+    fix(jEx, jKill, false);
+    fix(jKill, jKillPid, true);
+    fix(jKill, jTg, false);
+    fix(jKillPid, jKillSig, true);
+    fix(jKillPid, iAllowK0, false);
+    fix(jKillSig, iTrapK, true);
+    fix(jKillSig, iAllowK1, false);
+    fix(jTg, jTgTgid, true);
+    fix(jTg, iAllow1, false);
+    fix(jTgTgid, jTgSig, true);
+    fix(jTgTgid, iAllowT0, false);
+    fix(jTgSig, iTrapT, true);
+    fix(jTgSig, iAllowT1, false);
+
+    struct sock_fprog fp;
+    fp.len = (unsigned short)p.size();
+    fp.filter = const_cast<struct sock_filter*>(p.data());
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        char b[128];
+        snprintf(b, sizeof(b), "PR_SET_NO_NEW_PRIVS errno=%d", errno);
+        nlogCrit("SECCOMP", b);
+        return -1;
+    }
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fp) != 0) {
+        char b[128];
+        snprintf(b, sizeof(b), "PR_SET_SECCOMP errno=%d", errno);
+        nlogCrit("SECCOMP", b);
+        return -1;
+    }
+    g_seccompArmed.store(1);
+    nlogCrit("SECCOMP", "armed: exit/exit_group/kill(SIGKILL)/tgkill(SIGKILL) -> SIGSYS");
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2188,6 +2411,10 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
 
     installCrashHandler();
 
+    // seccomp goes in before AppDome's libloader is mapped: the filter is
+    // per-process, so every later thread inherits it.
+    if (modeOn(M_SECCOMP) || modeOn(M_NOKILL)) installSeccomp();
+
     // Before anything loads AppDome's libloader: own the RegisterNatives slot
     // so its native bridge is rewritten at bind time, not after the verdict.
     installJniBridge();
@@ -2231,6 +2458,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         patch("kill",     (void*)hookKill,     (void**)&origKill,     "kill");
         patch("tgkill",   (void*)hookTgkill,   (void**)&origTgkill,   "tgkill");
         patch("sigqueue", (void*)hookSigqueue, (void**)&origSigqueue, "sigqueue");
+        patch("pthread_exit", (void*)hookPthreadExit, (void**)&origPthreadExit, "pthread_exit");
     } else {
         nlogRaw("skip", "kill group");
     }
