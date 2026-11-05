@@ -1261,6 +1261,46 @@ void hookExit(int code)      { exitCommon(code, origExit, "exit"); }
 void hookExitRaw(int code)   { exitCommon(code, origExitRaw, "_exit"); }
 void hookExitUpper(int code) { exitCommon(code, origExitUpper, "_Exit"); }
 
+// libc exit() is the last step. System.exit() first shuts the VM down,
+// then calls it: swallowing exit() leaves a dead runtime behind. Stop the
+// call at AndroidRuntime::exit / JVM_Exit / JVM_Halt, before the shutdown
+// sequence starts.
+typedef void (*jvmExitFn)(int);
+jvmExitFn origJvmExit = nullptr;
+jvmExitFn origJvmHalt = nullptr;
+typedef void (*androidRuntimeExitFn)(void*, int);
+androidRuntimeExitFn origAndroidRuntimeExit = nullptr;
+
+void hookJvmExit(int code) {
+    if (modeOn(M_NOEXIT)) {
+        char b[96];
+        snprintf(b, sizeof(b), "JVM_Exit(%d) swallowed", code);
+        nlogRaw("killblock", b);
+        return;
+    }
+    if (origJvmExit) origJvmExit(code);
+}
+
+void hookJvmHalt(int code) {
+    if (modeOn(M_NOEXIT)) {
+        char b[96];
+        snprintf(b, sizeof(b), "JVM_Halt(%d) swallowed", code);
+        nlogRaw("killblock", b);
+        return;
+    }
+    if (origJvmHalt) origJvmHalt(code);
+}
+
+void hookAndroidRuntimeExit(void* self, int code) {
+    if (modeOn(M_NOEXIT)) {
+        char b[112];
+        snprintf(b, sizeof(b), "AndroidRuntime::exit(%d) swallowed", code);
+        nlogRaw("killblock", b);
+        return;
+    }
+    if (origAndroidRuntimeExit) origAndroidRuntimeExit(self, code);
+}
+
 // dl_iterate_phdr bypasses /proc/self/maps completely: it lists every
 // loaded .so (libBoxCore, Dobby, BlackBox) straight from the linker.
 // Filter marked libraries out of the callback stream.
@@ -1411,6 +1451,11 @@ ssize_t hookReadlink(const char* p, char* buf, size_t n) {
 
 void* sym(const char* name) { return dlsym(RTLD_DEFAULT, name); }
 
+void* symLib(const char* lib, const char* name) {
+    void* h = dlopen(lib, RTLD_NOW);
+    return h ? dlsym(h, name) : nullptr;
+}
+
 void patch(const char* name, void* replace, void** orig, const char* tag) {
     void* target = sym(name);
     if (!target) { nlogRaw("miss", name); return; }
@@ -1532,6 +1577,33 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         patch("exit",  (void*)hookExit,      (void**)&origExit,      "exit");
         patch("_exit", (void*)hookExitRaw,   (void**)&origExitRaw,   "_exit");
         patch("_Exit", (void*)hookExitUpper, (void**)&origExitUpper, "_Exit");
+
+        void* ar = symLib("libandroid_runtime.so", "_ZN7android14AndroidRuntime4exitEi");
+        if (!ar) ar = sym("_ZN7android14AndroidRuntime4exitEi");
+        if (ar && DobbyHook(ar, (void*)hookAndroidRuntimeExit,
+                            (void**)&origAndroidRuntimeExit) == 0) {
+            nlogRaw("hook", "AndroidRuntime::exit");
+        } else {
+            nlogRaw("miss", "AndroidRuntime::exit");
+        }
+
+        void* jvm = dlopen("libopenjdkjvm.so", RTLD_NOW);
+        if (jvm) {
+            void* je = dlsym(jvm, "JVM_Exit");
+            if (je && DobbyHook(je, (void*)hookJvmExit, (void**)&origJvmExit) == 0) {
+                nlogRaw("hook", "JVM_Exit");
+            } else {
+                nlogRaw("miss", "JVM_Exit");
+            }
+            void* jh = dlsym(jvm, "JVM_Halt");
+            if (jh && DobbyHook(jh, (void*)hookJvmHalt, (void**)&origJvmHalt) == 0) {
+                nlogRaw("hook", "JVM_Halt");
+            } else {
+                nlogRaw("miss", "JVM_Halt");
+            }
+        } else {
+            nlogRaw("miss", "libopenjdkjvm");
+        }
     } else {
         nlogRaw("skip", "exit group");
     }
