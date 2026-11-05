@@ -322,6 +322,96 @@ public final class OfxPatch {
     }
 
     /**
+     * Ground truth about the Google packages the guest can actually see.
+     *
+     * The engine loads libFirebaseCppApp and stops. Firebase's first act is to
+     * ask the package manager whether Play services exist and what version they
+     * are; the container answers that question from the guest's package table,
+     * which may hold a real GMS, a fake vending entry with no sourceDir, or
+     * nothing at all. Guessing which of the three is in play has cost four
+     * builds - this prints it once, with the availability code Firebase itself
+     * would receive.
+     */
+    public static void probeGms(android.content.Context c) {
+        if (c == null) {
+            return;
+        }
+        try {
+            android.content.pm.PackageManager pm = c.getPackageManager();
+            probePkg(pm, "com.google.android.gms");
+            probePkg(pm, "com.google.android.vending");
+            probePkg(pm, "com.android.vending");
+            probePkg(pm, "com.google.android.gsf");
+            probePkg(pm, "com.google.android.gms.ads");
+            probePkg(pm, "com.catsbit.oxidesurvivalisland");
+        } catch (Throwable t) {
+            OfxLog.log("gms probe failed " + t);
+        }
+
+        try {
+            Class<?> gaa = null;
+            try {
+                gaa = Class.forName("com.google.android.gms.common.GoogleApiAvailability");
+            } catch (Throwable ignored) {
+            }
+            OfxLog.log("gms class=" + (gaa != null));
+            if (gaa != null) {
+                try {
+                    Object inst = gaa.getMethod("getInstance").invoke(null);
+                    String r = "?";
+                    try {
+                        r = String.valueOf(gaa
+                                .getMethod("isGooglePlayServicesAvailable",
+                                        android.content.Context.class)
+                                .invoke(inst, c));
+                    } catch (Throwable t1) {
+                        try {
+                            r = String.valueOf(gaa
+                                    .getMethod("isGooglePlayServicesAvailable",
+                                            android.content.Context.class, int.class)
+                                    .invoke(inst, c, 0));
+                        } catch (Throwable t2) {
+                            r = "err:" + t2.getClass().getSimpleName();
+                        }
+                    }
+                    OfxLog.log("gms available=" + r);
+                } catch (Throwable t) {
+                    OfxLog.log("gms available err=" + t);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Class<?> fb = null;
+            try {
+                fb = Class.forName("com.google.firebase.FirebaseApp");
+            } catch (Throwable ignored) {
+            }
+            OfxLog.log("firebase class=" + (fb != null));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void probePkg(android.content.pm.PackageManager pm, String pkg) {
+        try {
+            android.content.pm.PackageInfo pi = pm.getPackageInfo(pkg, 0);
+            String src = null;
+            String lib = null;
+            String data = null;
+            if (pi.applicationInfo != null) {
+                src = pi.applicationInfo.sourceDir;
+                lib = pi.applicationInfo.nativeLibraryDir;
+                data = pi.applicationInfo.dataDir;
+            }
+            OfxLog.log("pkg " + pkg + " v=" + pi.versionName + "/" + pi.versionCode
+                    + " src=" + src + " lib=" + lib + " data=" + data);
+        } catch (Throwable t) {
+            OfxLog.log("pkg " + pkg + " ERR " + t.getClass().getSimpleName());
+        }
+    }
+
+    /**
      * The uid the guest runs under is the host's, so anything that maps
      * uid -> package (getPackagesForUid, currentPackageName) still answers
      * with the container. Record every one of those answers once at boot.
@@ -363,6 +453,10 @@ public final class OfxPatch {
                     + " myPid=" + android.os.Process.myPid());
         } catch (Throwable t) {
             OfxLog.log("env failed " + t);
+        }
+        try {
+            probeGms(app);
+        } catch (Throwable ignored) {
         }
     }
 

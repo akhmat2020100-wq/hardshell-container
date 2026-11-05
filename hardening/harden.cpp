@@ -413,24 +413,77 @@ bool nmsName(const char* n) {
     return strstr(n, "libnms.so") || strstr(n, "libpglarmor.so");
 }
 
+// Experiment switch, read once at boot from shared storage:
+//   /storage/emulated/0/Download/hardbox-nofb.txt
+// With the marker present, libFirebaseCppApp is denied at dlopen. If the engine
+// is waiting on a Firebase call, the P/Invoke now throws instead of hanging and
+// the game either handles it or falls over - both answers are worth having
+// without another fifteen-minute build.
+bool g_noFirebase = false;
+
+bool noFbName(const char* n) {
+    return n && strstr(n, "FirebaseCppApp");
+}
+
+std::atomic<int> g_dlFail{0};
+
+// A dlopen that never returns and a dlopen that returns null look identical in
+// a trace that only prints the name. Print the answer for the libraries the
+// guest's engine actually needs, and for every failure.
+void noteDl(const char* name, void* h) {
+    if (!h) {
+        int n = g_dlFail.fetch_add(1);
+        if (name && n < 300) {
+            const char* e = dlerror();
+            char b[420];
+            snprintf(b, sizeof(b), "FAIL %s err=%s", name, e ? e : "-");
+            nlogCrit("dl", b);
+        }
+        return;
+    }
+    if (name && (strstr(name, "Firebase") || strstr(name, "libunity") ||
+                 strstr(name, "libil2cpp") || strstr(name, "libmain") ||
+                 strstr(name, "libloader"))) {
+        char b[420];
+        snprintf(b, sizeof(b), "OK %s h=%p", name, h);
+        nlogCrit("dl", b);
+    }
+}
+
 void* hookDlopen(const char* name, int flags) {
     if (name) trace("dlopen", name);
+    if (g_noFirebase && noFbName(name)) {
+        nlogCrit("blocked", name);
+        errno = ENOENT;
+        return nullptr;
+    }
     if (modeOn(M_NMS) && nmsName(name)) {
         nlogRaw("blocked", name);
         errno = ENOENT;
         return nullptr;
     }
-    return origDlopen ? origDlopen(name, flags) : nullptr;
+    dlerror();
+    void* r = origDlopen ? origDlopen(name, flags) : nullptr;
+    noteDl(name, r);
+    return r;
 }
 
 void* hookDlopenExt(const char* name, int flags, const void* info) {
     if (name) trace("dlopen", name);
+    if (g_noFirebase && noFbName(name)) {
+        nlogCrit("blocked", name);
+        errno = ENOENT;
+        return nullptr;
+    }
     if (modeOn(M_NMS) && nmsName(name)) {
         nlogRaw("blocked", name);
         errno = ENOENT;
         return nullptr;
     }
-    return origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
+    dlerror();
+    void* r = origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
+    noteDl(name, r);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,19 +1358,208 @@ int installSeccomp() {
 }
 
 // ---------------------------------------------------------------------------
+// thread probe: a hang has a shape, and two numbers give it away.
+//
+// cpu  - ticks burned between beats. A player loop waiting on a socket spends
+//        nothing; a retry spin owns a whole core; a deadlock spends nothing and
+//        still never finishes, which is why cpu alone is not enough.
+// sys  - the kernel's own answer for what the thread is sitting in. futex with
+//        a shared address across two threads names a deadlock; ppoll with a
+//        timeout names a poll loop; running names a spin.
+//
+// Read through raw syscalls so the file hooks cannot re-enter themselves.
+// ---------------------------------------------------------------------------
+struct ThrSlot {
+    int  tid;
+    long ticks;
+};
+static ThrSlot g_thr[256];
+static int g_thrUsed = 0;
+
+static int rawOpenRO(const char* path) {
+    return (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
+}
+
+static int rawReadFd(int fd, char* buf, int cap) {
+    if (cap <= 1) return 0;
+    long n = syscall(SYS_read, fd, buf, (size_t)(cap - 1));
+    if (n < 0) n = 0;
+    buf[n] = '\0';
+    return (int)n;
+}
+
+static bool probeWanted(const char* comm) {
+    if (!comm[0]) return false;
+    if (strstr(comm, "Unity")) return true;
+    if (strstr(comm, "RenderThread")) return true;
+    if (strstr(comm, "Job.Worker")) return true;
+    if (strstr(comm, "ofx")) return false;
+    if (strcmp(comm, "main") == 0) return true;
+    return false;
+}
+
+static void probeOne(int tid) {
+    char p[112];
+    char comm[64] = {0};
+
+    snprintf(p, sizeof(p), "/proc/self/task/%d/comm", tid);
+    int fd = rawOpenRO(p);
+    if (fd < 0) return;
+    rawReadFd(fd, comm, sizeof(comm));
+    syscall(SYS_close, fd);
+    char* nl = strchr(comm, '\n');
+    if (nl) *nl = '\0';
+    if (!comm[0]) snprintf(comm, sizeof(comm), "?");
+
+    long utime = 0, stime = 0;
+    char st = '?';
+    snprintf(p, sizeof(p), "/proc/self/task/%d/stat", tid);
+    fd = rawOpenRO(p);
+    if (fd >= 0) {
+        char sb[1024];
+        int got = rawReadFd(fd, sb, sizeof(sb));
+        syscall(SYS_close, fd);
+        if (got > 0) {
+            char* rp = strrchr(sb, ')');
+            if (rp && rp[1] == ' ') {
+                sscanf(rp + 2,
+                       "%c %*d %*d %*d %*d %*d %*lu %*lu %*lu %*lu %*lu %lu %lu",
+                       &st, &utime, &stime);
+            }
+        }
+    }
+
+    long ticks = utime + stime;
+    long delta = -1;
+    int i = 0;
+    for (; i < g_thrUsed; i++) {
+        if (g_thr[i].tid == tid) {
+            delta = ticks - g_thr[i].ticks;
+            g_thr[i].ticks = ticks;
+            break;
+        }
+    }
+    if (i == g_thrUsed) {
+        if (g_thrUsed < 256) {
+            g_thr[g_thrUsed].tid = tid;
+            g_thr[g_thrUsed].ticks = ticks;
+            g_thrUsed++;
+        }
+    }
+
+    // 100 jiffies per second on Android: 150 ticks over a 2 s beat is 75% of a core.
+    bool hot = delta >= 150;
+    bool watched = probeWanted(comm);
+    if (!hot && !watched) return;
+
+    char sc[120] = "?";
+    snprintf(p, sizeof(p), "/proc/self/task/%d/syscall", tid);
+    fd = rawOpenRO(p);
+    if (fd >= 0) {
+        char sb[200];
+        rawReadFd(fd, sb, sizeof(sb));
+        syscall(SYS_close, fd);
+        char* e = strchr(sb, '\n');
+        if (e) *e = '\0';
+        sb[110] = '\0';
+        snprintf(sc, sizeof(sc), "%s", sb[0] ? sb : "?");
+    }
+
+    char line[320];
+    snprintf(line, sizeof(line), "THR id=%d name=%s st=%c cpu=%ldtck sys=%s",
+             tid, comm, st, delta, sc);
+    nlogCrit("probe", line);
+}
+
+struct ProbeDent {
+    uint64_t       d_ino;
+    int64_t        d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[320];
+};
+
+static void threadProbe() {
+    int dfd = rawOpenRO("/proc/self/task");
+    if (dfd < 0) return;
+    for (;;) {
+        char db[4096];
+        long n = syscall(SYS_getdents64, dfd, db, sizeof(db));
+        if (n <= 0) break;
+        for (long off = 0; off + 20 <= n; ) {
+            ProbeDent* d = (ProbeDent*)(db + off);
+            if (d->d_reclen < 20 || off + (long)d->d_reclen > n) break;
+            off += d->d_reclen;
+            if (d->d_name[0] < '0' || d->d_name[0] > '9') continue;
+            probeOne(atoi(d->d_name));
+        }
+    }
+    syscall(SYS_close, dfd);
+
+    char b[48];
+    snprintf(b, sizeof(b), "threads=%d", g_thrUsed);
+    nlogCrit("probe", b);
+}
+
+// ---------------------------------------------------------------------------
+// AAssetManager: Unity's scene data never crosses libc.
+//
+// The engine reads assets through an AAssetManager bound to the APK at boot,
+// so not one open/openat from libunity ever reaches the file hooks - the trace
+// looks empty even while the game is loading a scene. Hooking the NDK door
+// shows the reads, and a stream of MISS answers from it is the hang itself.
+// ---------------------------------------------------------------------------
+typedef void* (*aassetOpenFn)(void*, const char*, int);
+typedef void* (*aassetDirFn)(void*, const char*);
+aassetOpenFn origAssetOpen = nullptr;
+aassetDirFn  origAssetOpenDir = nullptr;
+std::atomic<long> g_assetCalls{0};
+std::atomic<int>  g_assetFail{0};
+std::atomic<int>  g_assetLog{0};
+
+void* hookAssetOpen(void* mgr, const char* name, int mode) {
+    void* r = origAssetOpen ? origAssetOpen(mgr, name, mode) : nullptr;
+    g_assetCalls.fetch_add(1);
+    if (!r) g_assetFail.fetch_add(1);
+    int n = g_assetLog.fetch_add(1);
+    if (name && (n < 900 || (!r && n < 1400))) {
+        char b[420];
+        snprintf(b, sizeof(b), "%s -> %p%s", name, r, r ? "" : "  MISS");
+        nlogRaw("asset", b);
+    }
+    return r;
+}
+
+void* hookAssetOpenDir(void* mgr, const char* name) {
+    void* r = origAssetOpenDir ? origAssetOpenDir(mgr, name) : nullptr;
+    g_assetCalls.fetch_add(1);
+    if (name) {
+        char b[420];
+        snprintf(b, sizeof(b), "dir %s -> %p%s", name, r, r ? "" : "  MISS");
+        nlogRaw("asset", b);
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // heartbeat: proves when the process stopped breathing
 // ---------------------------------------------------------------------------
 static void jniStrStats(char* out, size_t cap);
 
 void* hbThread(void*) {
-    for (int i = 0; i < 90 && !g_hbStop.load(); i++) {
-        char b[32];
-        snprintf(b, sizeof(b), "hb %d", i);
-        nlogRaw("alive", b);
+    for (int i = 0; i < 300 && !g_hbStop.load(); i++) {
+        char b[160];
+        if ((i % 5) == 0) {
+            snprintf(b, sizeof(b), "hb %d", i);
+            nlogRaw("alive", b);
+        }
+        threadProbe();
         if ((i % 5) == 4) {
             char s[96];
             jniStrStats(s, sizeof(s));
-            nlogCrit("jni", s);
+            snprintf(b, sizeof(b), "%s assets=%ld miss=%d",
+                     s, g_assetCalls.load(), g_assetFail.load());
+            nlogCrit("jni", b);
         }
         struct timespec ts;
         ts.tv_sec = 2;
@@ -1848,6 +2090,26 @@ void patch(const char* name, void* replace, void** orig, const char* tag) {
     void* target = sym(name);
     if (!target) { nlogRaw("miss", name); return; }
     if (DobbyHook(target, replace, orig) != 0) { nlogRaw("fail", name); return; }
+    nlogRaw("hook", tag ? tag : name);
+}
+
+// NDK entry points live in libandroid.so and are not in the default lookup
+// scope of a guest process, so they need the handle.
+void patchLib(const char* lib, const char* name, void* replace, void** orig,
+              const char* tag) {
+    void* target = symLib(lib, name);
+    if (!target) {
+        char b[160];
+        snprintf(b, sizeof(b), "miss %s@%s", name, lib);
+        nlogRaw("patch", b);
+        return;
+    }
+    if (DobbyHook(target, replace, orig) != 0) {
+        char b[160];
+        snprintf(b, sizeof(b), "fail %s@%s", name, lib);
+        nlogRaw("patch", b);
+        return;
+    }
     nlogRaw("hook", tag ? tag : name);
 }
 
@@ -2428,6 +2690,19 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         return;
     }
 
+    // switches live on shared storage so a behaviour can be flipped between
+    // runs without rebuilding the container
+    {
+        const char* marks[] = {
+            "/storage/emulated/0/Download/hardbox-nofb.txt",
+            "/storage/emulated/0/Download/HardBox/hardbox-nofb.txt",
+        };
+        for (size_t i = 0; i < sizeof(marks) / sizeof(marks[0]); i++) {
+            if (access(marks[i], F_OK) == 0) { g_noFirebase = true; break; }
+        }
+        nlogCrit("switch", g_noFirebase ? "nofb=on" : "nofb=off");
+    }
+
     logSymbols();
 
     // liblog mirror goes in before anything else: the first anti-cheat log
@@ -2439,6 +2714,13 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     } else {
         nlogRaw("skip", "liblog mirror");
     }
+
+    // The guest's scene data lives behind AAssetManager and never reaches the
+    // libc file hooks; this is the only door that sees it.
+    patchLib("libandroid.so", "AAssetManager_open",    (void*)hookAssetOpen,
+             (void**)&origAssetOpen, "AAssetManager_open");
+    patchLib("libandroid.so", "AAssetManager_openDir", (void*)hookAssetOpenDir,
+             (void**)&origAssetOpenDir, "AAssetManager_openDir");
 
     if (modeOn(M_UID)) {
         patch("getuid",  (void*)hookGetuid,  (void**)&origGetuid,  "getuid");
