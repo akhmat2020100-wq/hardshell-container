@@ -50,6 +50,8 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 
@@ -592,6 +594,31 @@ static int dexNeedles(const unsigned char* d, size_t n, const DexHead& h) {
     return m;
 }
 
+// Compact dex: same header prefix, magic cdex00N. String ids sit where the
+// standard dex keeps them, but the payload is usually copied, so match raw.
+static bool cdexHeadOk(uintptr_t addr, DexHead* out) {
+    unsigned char h[0x70];
+    readLoose(addr, h, sizeof(h));
+    if (memcmp(h, "cdex", 4) != 0) return false;
+    if (h[7] != 0) return false;
+    DexHead d;
+    memset(&d, 0, sizeof(d));
+    memcpy(&d.fileSize, h + 0x20, 4);
+    memcpy(&d.headerSize, h + 0x24, 4);
+    if (d.fileSize < 0x28u || d.fileSize > (64u << 20)) return false;
+    if (d.headerSize < 0x28u || d.headerSize > 0x400u) return false;
+    *out = d;
+    return true;
+}
+
+static int rawNeedles(const unsigned char* d, size_t n) {
+    int m = 0;
+    if (memmem(d, n, "qnxUk1", 6)) m++;
+    if (memmem(d, n, "LqnxUk1", 7)) m++;
+    if (memmem(d, n, "Kumiho", 6)) m++;
+    return m;
+}
+
 void dumpDecryptedDex() {
     if (g_dexDump.exchange(true)) return;
     nlogRaw("DUMP", "start v2");
@@ -629,97 +656,158 @@ void dumpDecryptedDex() {
     unsigned char* buf = (unsigned char*)malloc(CHUNK + OVER);
     if (!buf) { nlogRaw("DUMP", "no scan buffer"); return; }
 
-    int regions = 0, cands = 0, otherDumps = 0, matchDumps = 0;
-    size_t scanned = 0;
-    const char* mb = mbS.c_str();
-    size_t pos = 0, msz = mbS.size();
-
-    while (pos < msz && scanned < SCAN_CAP) {
-        const char* ls = mb + pos;
-        const char* nl = strchr(ls, '\n');
-        size_t llen = nl ? (size_t)(nl - ls) : (msz - pos);
-        std::string line(ls, llen);
-        size_t dash = line.find('-');
-        size_t sp = line.find(' ');
-        if (dash != std::string::npos && sp != std::string::npos) {
-            uintptr_t s = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
-            uintptr_t e = (uintptr_t)strtoull(line.c_str() + dash + 1, nullptr, 16);
-            size_t tsp = sp;
-            while (tsp < line.size() && line[tsp] == ' ') tsp++;
-            size_t pe = line.find(' ', tsp);
-            if (pe == std::string::npos) pe = line.size();
-            char perms[8] = {0};
-            size_t pc = pe - tsp;
-            if (pc > 7) pc = 7;
-            memcpy(perms, line.data() + tsp, pc);
-            const char* path = "";
-            size_t q = pe;
-            // maps: start-end perms offset dev inode [path]; step past three
-            // tokens so the path keeps its own spaces ([anon:dalvik-main space]).
-            for (int t = 0; t < 3; t++) {
+    // Regions are ranked, not walked in maps order: a 900 MB budget dies in
+    // dalvik-main space long before the 4 MB [anon:dalvik-DEX data] mapping
+    // that actually holds the decrypted payload. Dex-bearing mappings first.
+    struct Reg {
+        uintptr_t s, e;
+        size_t len;
+        int score;
+        char path[160];
+    };
+    std::vector<Reg> regs;
+    {
+        const char* mb0 = mbS.c_str();
+        size_t p0 = 0, n0 = mbS.size();
+        while (p0 < n0) {
+            const char* ls = mb0 + p0;
+            const char* nl = strchr(ls, '\n');
+            size_t llen = nl ? (size_t)(nl - ls) : (n0 - p0);
+            std::string line(ls, llen);
+            size_t dash = line.find('-');
+            size_t sp = line.find(' ');
+            if (dash != std::string::npos && sp != std::string::npos) {
+                Reg r;
+                memset(&r, 0, sizeof(r));
+                r.s = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
+                r.e = (uintptr_t)strtoull(line.c_str() + dash + 1, nullptr, 16);
+                size_t tsp = sp;
+                while (tsp < line.size() && line[tsp] == ' ') tsp++;
+                size_t pe = line.find(' ', tsp);
+                if (pe == std::string::npos) pe = line.size();
+                char perms[8] = {0};
+                size_t pc = pe - tsp;
+                if (pc > 7) pc = 7;
+                memcpy(perms, line.data() + tsp, pc);
+                size_t q = pe;
+                for (int t = 0; t < 3; t++) {
+                    while (q < line.size() && line[q] == ' ') q++;
+                    while (q < line.size() && line[q] != ' ') q++;
+                }
                 while (q < line.size() && line[q] == ' ') q++;
-                while (q < line.size() && line[q] != ' ') q++;
-            }
-            while (q < line.size() && line[q] == ' ') q++;
-            if (q < line.size()) path = line.c_str() + q;
-
-            // Anonymous memory only: disk images are mapped from files and
-            // cannot hold the decrypted payload. Free-list holes are fine
-            // here, the read path returns EFAULT instead of dying.
-            bool anon = (path[0] == 0) || (path[0] == '[');
-            if (perms[0] == 'r' && anon && e > s) {
-                size_t len = (size_t)(e - s);
-                if (len > REG_CAP) len = REG_CAP;
-                regions++;
-                size_t rp = 0;
-                while (rp < len && scanned < SCAN_CAP) {
-                    size_t want = len - rp;
-                    if (want > CHUNK + OVER) want = CHUNK + OVER;
-                    readLoose(s + rp, buf, want);
-                    size_t off = 0;
-                    while (off + 8 <= want) {
-                        unsigned char* m = (unsigned char*)memmem(buf + off, want - off, "dex\n", 4);
-                        if (!m) break;
-                        size_t i = (size_t)(m - buf);
-                        uintptr_t ca = s + rp + i;
-                        DexHead h;
-                        if (dexHeadOk(ca, &h)) {
-                            cands++;
-                            unsigned char* dex = (unsigned char*)malloc(h.fileSize);
-                            if (dex) {
-                                readLoose(ca, dex, h.fileSize);
-                                int mcount = dexNeedles(dex, h.fileSize, h);
-                                char b[300];
-                                snprintf(b, sizeof(b),
-                                         "cand addr=0x%llx size=%u strings=%u match=%d",
-                                         (unsigned long long)ca, h.fileSize,
-                                         h.stringIdsSize, mcount);
-                                nlogRaw("DUMP", b);
-                                if (mcount > 0) {
-                                    if (matchDumps < 4) {
-                                        char nm[48];
-                                        snprintf(nm, sizeof(nm), "ofxqnx_%d.dex", matchDumps);
-                                        writeNamed(dir, nm, dex, h.fileSize);
-                                        matchDumps++;
-                                    }
-                                } else if (otherDumps < 3) {
-                                    char nm[48];
-                                    snprintf(nm, sizeof(nm), "ofxother_%d.dex", otherDumps);
-                                    writeNamed(dir, nm, dex, h.fileSize);
-                                    otherDumps++;
-                                }
-                                free(dex);
-                            }
+                if (q < line.size()) {
+                    size_t pl = line.size() - q;
+                    if (pl > sizeof(r.path) - 1) pl = sizeof(r.path) - 1;
+                    memcpy(r.path, line.c_str() + q, pl);
+                    r.path[pl] = 0;
+                }
+                bool anon = (r.path[0] == 0) || (r.path[0] == '[');
+                r.len = (r.e > r.s) ? (size_t)(r.e - r.s) : 0;
+                if (perms[0] == 'r' && anon && r.len) {
+                    const char* pth = r.path;
+                    if (strstr(pth, "dalvik-DEX")) {
+                        r.score = 0;
+                    } else if (strstr(pth, "memfd")) {
+                        r.score = 1;
+                    } else if (strstr(pth, ".dex")) {
+                        r.score = 2;
+                    } else if (strstr(pth, "dalvik")) {
+                        // jit / gc / allocator spaces never hold a dex image.
+                        if (strstr(pth, "jit") || strstr(pth, "zygote") ||
+                            strstr(pth, "alloc") || strstr(pth, "free-list") ||
+                            strstr(pth, "mark-stack") || strstr(pth, "rosalloc") ||
+                            strstr(pth, "non-moving") || strstr(pth, "indirect") ||
+                            strstr(pth, "stack_and_tls")) {
+                            r.score = 9;
+                        } else {
+                            r.score = 3;
                         }
-                        off = i + 4;
+                    } else {
+                        r.score = (pth[0] == 0) ? 3 : 4;
                     }
-                    rp += CHUNK;
-                    scanned += want;
+                    regs.push_back(r);
                 }
             }
+            if (!nl) break;
+            p0 += (size_t)(nl - ls) + 1;
         }
-        if (!nl) break;
-        pos += (size_t)(nl - ls) + 1;
+    }
+    std::stable_sort(regs.begin(), regs.end(),
+                     [](const Reg& a, const Reg& b) { return a.score < b.score; });
+    {
+        char b[128];
+        snprintf(b, sizeof(b), "regions ranked=%zu total=%zu", regs.size(), mbS.size());
+        nlogRaw("DUMP", b);
+    }
+
+    int regions = 0, cands = 0, otherDumps = 0, matchDumps = 0;
+    size_t scanned = 0;
+
+    for (size_t ri = 0; ri < regs.size() && scanned < SCAN_CAP; ri++) {
+        Reg& r = regs[ri];
+        if (r.score >= 8) break;
+        size_t len = r.len;
+        if (len > REG_CAP) len = REG_CAP;
+        regions++;
+        if (r.score <= 2) {
+            char rb[220];
+            snprintf(rb, sizeof(rb), "hit region score=%d len=%zu %s", r.score, len, r.path);
+            nlogRaw("DUMP", rb);
+        }
+        size_t rp = 0;
+        while (rp < len && scanned < SCAN_CAP) {
+            size_t want = len - rp;
+            if (want > CHUNK + OVER) want = CHUNK + OVER;
+            readLoose(r.s + rp, buf, want);
+            size_t off = 0;
+            while (off + 8 <= want) {
+                unsigned char* md = (unsigned char*)memmem(buf + off, want - off, "dex\n", 4);
+                unsigned char* mc = (unsigned char*)memmem(buf + off, want - off, "cdex", 4);
+                unsigned char* m = md;
+                bool compact = false;
+                if (!m || (mc && mc < m)) {
+                    m = mc;
+                    compact = true;
+                }
+                if (!m) break;
+                size_t i = (size_t)(m - buf);
+                uintptr_t ca = r.s + rp + i;
+                DexHead h;
+                bool ok = compact ? cdexHeadOk(ca, &h) : dexHeadOk(ca, &h);
+                if (ok) {
+                    cands++;
+                    unsigned char* dex = (unsigned char*)malloc(h.fileSize);
+                    if (dex) {
+                        readLoose(ca, dex, h.fileSize);
+                        int mcount = compact ? rawNeedles(dex, h.fileSize)
+                                             : dexNeedles(dex, h.fileSize, h);
+                        char b[300];
+                        snprintf(b, sizeof(b),
+                                 "cand addr=0x%llx size=%u cdex=%d match=%d @%s",
+                                 (unsigned long long)ca, h.fileSize, compact ? 1 : 0,
+                                 mcount, r.path[0] ? r.path : "(anon)");
+                        nlogRaw("DUMP", b);
+                        if (mcount > 0) {
+                            if (matchDumps < 4) {
+                                char nm[48];
+                                snprintf(nm, sizeof(nm), "ofxqnx_%d.dex", matchDumps);
+                                writeNamed(dir, nm, dex, h.fileSize);
+                                matchDumps++;
+                            }
+                        } else if (otherDumps < 3) {
+                            char nm[48];
+                            snprintf(nm, sizeof(nm), "ofxother_%d.dex", otherDumps);
+                            writeNamed(dir, nm, dex, h.fileSize);
+                            otherDumps++;
+                        }
+                        free(dex);
+                    }
+                }
+                off = i + 4;
+            }
+            rp += CHUNK;
+            scanned += want;
+        }
     }
     free(buf);
 

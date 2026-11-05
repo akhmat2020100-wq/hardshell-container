@@ -622,6 +622,125 @@ jobs:
                       "IActivityTaskManagerProxy finish/start")
               wr(p, s)
 
+          # ---------- proof of injection + the H-transaction brake ----------
+          # The activity is not finished by a binder call we can see, so the
+          # verdict tears it down through the client transaction queue. Drop
+          # DestroyActivityItem there while keepalive is on, and log every
+          # transaction so the exact item class shows up if this is wrong.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/IActivityTaskManagerProxy.java"
+          s = rd(p)
+          if "ofxFinishRemoveTask" not in s:
+              s = sub(s, '    @ProxyMethod("setTaskDescription")',
+                      '    @ProxyMethod("finishAndRemoveTask")\n'
+                      "    public static class ofxFinishRemoveTask extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            boolean keep = false;\n"
+                      "            try {\n"
+                      "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive();\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("finishRemoveTask keep=" + keep);\n'
+                      "            if (keep) {\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("finishRemoveTask dropped");\n'
+                      "                return null;\n"
+                      "            }\n"
+                      "            return method.invoke(who, args);\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("setTaskDescription")',
+                      "ATM finishAndRemoveTask")
+              wr(p, s)
+
+          if 'OfxLog.log("ATM inject")' not in s:
+              s = sub(s,
+                      "    protected void inject(Object baseInvocation, Object proxyInvocation) {\n"
+                      "        replaceSystemService(\"activity_task\");",
+                      "    protected void inject(Object baseInvocation, Object proxyInvocation) {\n"
+                      '        top.niunaijun.blackbox.util.OfxLog.log("ATM inject");\n'
+                      "        replaceSystemService(\"activity_task\");",
+                      "ATM inject log")
+              wr(p, s)
+
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/HCallbackProxy.java"
+          s = rd(p)
+          if "OfxPatch.keepAlive" not in s:
+              s = sub(s,
+                      "    @Override\n"
+                      "    public boolean handleMessage(@NonNull Message msg) {\n"
+                      "        if (!mBeing.getAndSet(true)) {",
+                      "    @Override\n"
+                      "    public boolean handleMessage(@NonNull Message msg) {\n"
+                      "        try {\n"
+                      "            if (top.niunaijun.blackbox.util.OfxPatch.keepAlive()\n"
+                      "                    && BuildCompat.isPie()\n"
+                      "                    && msg.what == BRActivityThreadH.get().EXECUTE_TRANSACTION()\n"
+                      "                    && msg.obj != null) {\n"
+                      "                java.util.List<Object> cbs =\n"
+                      "                        BRClientTransaction.get(msg.obj).mActivityCallbacks();\n"
+                      "                if (cbs != null) {\n"
+                      "                    boolean drop = false;\n"
+                      "                    for (Object o : cbs) {\n"
+                      "                        if (o != null && o.getClass().getName().endsWith(\"DestroyActivityItem\")) {\n"
+                      "                            drop = true;\n"
+                      "                        }\n"
+                      "                    }\n"
+                      '                    top.niunaijun.blackbox.util.OfxLog.log("hMsg destroy=" + drop);\n'
+                      "                    if (drop) {\n"
+                      "                        return true;\n"
+                      "                    }\n"
+                      "                }\n"
+                      "            }\n"
+                      "        } catch (Throwable t) {\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("hMsg guard " + t);\n'
+                      "        }\n"
+                      "        if (!mBeing.getAndSet(true)) {",
+                      "HCallback destroy drop")
+              s = sub(s,
+                      "    public void injectHook() {\n"
+                      "        mOtherCallback = getHCallback();",
+                      "    public void injectHook() {\n"
+                      '        top.niunaijun.blackbox.util.OfxLog.log("HCallback inject");\n'
+                      "        mOtherCallback = getHCallback();",
+                      "HCallback inject log")
+              wr(p, s)
+
+          # Force the activity_task proxy into the guest process: injectAll runs
+          # in the host, and only a checked handful reaches the guest.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/delegate/AppInstrumentation.java"
+          s = rd(p)
+          if "ofxAtmForced" not in s:
+              s = sub(s,
+                      "public final class AppInstrumentation extends BaseInstrumentationDelegate implements IInjectHook {",
+                      "public final class AppInstrumentation extends BaseInstrumentationDelegate implements IInjectHook {\n"
+                      "    private static int ofxAtmForced;",
+                      "AppInstrumentation atm field")
+              s = sub(s,
+                      '        OfxLog.log("Activity.onCreate " + activity.getClass().getName());',
+                      '        OfxLog.log("Activity.onCreate " + activity.getClass().getName());\n'
+                      "        if (ofxAtmForced == 0\n"
+                      "                && top.niunaijun.blackbox.util.OfxPatch.keepAlive()) {\n"
+                      "            ofxAtmForced = 1;\n"
+                      "            try {\n"
+                      "                top.niunaijun.blackbox.fake.service.IActivityTaskManagerProxy atm =\n"
+                      "                        new top.niunaijun.blackbox.fake.service.IActivityTaskManagerProxy();\n"
+                      "                atm.injectHook();\n"
+                      "                int n = -1;\n"
+                      "                try {\n"
+                      "                    java.lang.reflect.Field f = top.niunaijun.blackbox.fake.hook.ClassInvocationStub.class\n"
+                      "                            .getDeclaredField(\"mMethodHookMap\");\n"
+                      "                    f.setAccessible(true);\n"
+                      "                    java.util.Map m = (java.util.Map) f.get(atm);\n"
+                      "                    n = m == null ? -1 : m.size();\n"
+                      "                } catch (Throwable ignored) { }\n"
+                      '                OfxLog.log("ATM forced hooks=" + n);\n'
+                      "            } catch (Throwable t) {\n"
+                      '                OfxLog.log("ATM force fail " + t);\n'
+                      "            }\n"
+                      "        }",
+                      "AppInstrumentation atm force")
+              wr(p, s)
+
           # ---------- keepalive + class-block switches, read from Download ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/util/OfxPatch.java"
           s = rd(p)
