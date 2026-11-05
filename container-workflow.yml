@@ -685,7 +685,8 @@ jobs:
                       "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
                       "            boolean keep = false;\n"
                       "            try {\n"
-                      "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive();\n"
+                      "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive()\n"
+                      "                        && top.niunaijun.blackbox.app.BActivityThread.getAppConfig() != null;\n"
                       "            } catch (Throwable ignored) { }\n"
                       '            top.niunaijun.blackbox.util.OfxLog.log("clientFinish keep=" + keep\n'
                       '                    + " argc=" + (args == null ? 0 : args.length));\n'
@@ -719,7 +720,8 @@ jobs:
                       "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
                       "            boolean keep = false;\n"
                       "            try {\n"
-                      "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive();\n"
+                      "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive()\n"
+                      "                        && top.niunaijun.blackbox.app.BActivityThread.getAppConfig() != null;\n"
                       "            } catch (Throwable ignored) { }\n"
                       '            top.niunaijun.blackbox.util.OfxLog.log("commonFinish keep=" + keep);\n'
                       "            if (keep) {\n"
@@ -800,7 +802,8 @@ jobs:
                       "    public void callApplicationOnCreate(Application app) {",
                       "    @Override\n"
                       "    public void callActivityOnPause(Activity activity) {\n"
-                      "        if (top.niunaijun.blackbox.util.OfxPatch.keepAlive()) {\n"
+                      "        if (top.niunaijun.blackbox.util.OfxPatch.keepAlive()\n"
+                      "                && BActivityThread.getAppConfig() != null) {\n"
                       '            top.niunaijun.blackbox.util.OfxLog.log("skip onPause " + activity.getClass().getName());\n'
                       "            return;\n"
                       "        }\n"
@@ -809,7 +812,8 @@ jobs:
                       "\n"
                       "    @Override\n"
                       "    public void callActivityOnStop(Activity activity) {\n"
-                      "        if (top.niunaijun.blackbox.util.OfxPatch.keepAlive()) {\n"
+                      "        if (top.niunaijun.blackbox.util.OfxPatch.keepAlive()\n"
+                      "                && BActivityThread.getAppConfig() != null) {\n"
                       '            top.niunaijun.blackbox.util.OfxLog.log("skip onStop " + activity.getClass().getName());\n'
                       "            return;\n"
                       "        }\n"
@@ -818,7 +822,8 @@ jobs:
                       "\n"
                       "    @Override\n"
                       "    public void callActivityOnDestroy(Activity activity) {\n"
-                      "        if (top.niunaijun.blackbox.util.OfxPatch.keepAlive()) {\n"
+                      "        if (top.niunaijun.blackbox.util.OfxPatch.keepAlive()\n"
+                      "                && BActivityThread.getAppConfig() != null) {\n"
                       '            top.niunaijun.blackbox.util.OfxLog.log("skip onDestroy " + activity.getClass().getName());\n'
                       "            return;\n"
                       "        }\n"
@@ -841,6 +846,7 @@ jobs:
                       "    public boolean handleMessage(@NonNull Message msg) {\n"
                       "        try {\n"
                       "            if (top.niunaijun.blackbox.util.OfxPatch.keepAlive()\n"
+                      "                    && BActivityThread.getAppConfig() != null\n"
                       "                    && BuildCompat.isPie()\n"
                       "                    && msg.what == BRActivityThreadH.get().EXECUTE_TRANSACTION()\n"
                       "                    && msg.obj != null) {\n"
