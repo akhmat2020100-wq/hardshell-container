@@ -1496,6 +1496,153 @@ void logSymbols() {
     nlogRaw("sym", b);
 }
 
+// ---------------------------------------------------------------------------
+// JNI bridge interception - AppDome / Kumiho native surface
+//
+// AppDome binds its native methods through RegisterNatives while its library
+// loads, so the Java side never references a Java_* export. libart exports no
+// C++ symbol for that entry point, but the JNIEnv function table is one
+// process-wide struct and its slot order is ABI-fixed. Slot 219 is GetJavaVM:
+// probe it first and require it to answer with our own VM before touching the
+// neighbouring slot. Only then is slot 215 known to be RegisterNatives.
+//
+// Threat-state query shape: javaMethod(String[] names) -> boolean[].
+// Reporting all-false means "no threat active" for every name the SDK asks
+// about, which is what keeps the verdict screen from ever being scheduled.
+// ---------------------------------------------------------------------------
+typedef jint (*regNativesFn)(JNIEnv*, jclass, const JNINativeMethod*, jint);
+static regNativesFn g_origRegNatives = nullptr;
+static std::atomic<int> g_jniLog{0};
+
+static void jniClassName(JNIEnv* env, jclass cls, char* out, size_t cap) {
+    out[0] = '\0';
+    if (!cls) return;
+    jclass classClass = env->FindClass("java/lang/Class");
+    if (!classClass) { env->ExceptionClear(); return; }
+    jmethodID getName = env->GetMethodID(classClass, "getName", "()Ljava/lang/String;");
+    if (!getName) { env->ExceptionClear(); env->DeleteLocalRef(classClass); return; }
+    jstring s = (jstring) env->CallObjectMethod(cls, getName);
+    if (s) {
+        const char* c = env->GetStringUTFChars(s, nullptr);
+        if (c) {
+            snprintf(out, cap, "%s", c);
+            env->ReleaseStringUTFChars(s, c);
+        }
+        env->DeleteLocalRef(s);
+    }
+    env->DeleteLocalRef(classClass);
+    env->ExceptionClear();
+}
+
+// Answers "nothing is wrong" for any threat list. Enumeration in ART may hand
+// the array back with the length the caller asked for; keep it exact.
+static jbooleanArray JNICALL stubThreatState(JNIEnv* env, jclass, jobjectArray names) {
+    jsize n = names ? env->GetArrayLength(names) : 0;
+    if (n < 0) n = 0;
+    jbooleanArray out = env->NewBooleanArray(n > 0 ? n : 1);
+    if (!out) return nullptr;
+    jboolean zero[64];
+    memset(zero, 0, sizeof(zero));
+    for (jsize off = 0; off < n; ) {
+        jsize chunk = (n - off) > 64 ? 64 : (n - off);
+        env->SetBooleanArrayRegion(out, off, chunk, zero);
+        off += chunk;
+    }
+    return out;
+}
+
+static jint JNICALL hookRegNatives(JNIEnv* env, jclass cls,
+                                   const JNINativeMethod* methods, jint n) {
+    if (!g_origRegNatives) return JNI_ERR;
+    if (!methods || n <= 0) return g_origRegNatives(env, cls, methods, n);
+
+    char cn[192];
+    jniClassName(env, cls, cn, sizeof(cn));
+
+    // Only the decrypted AppDome package may be rewritten. The prefix is
+    // stable for this APK build (qnxUk1.* shows up in every kill stack) and
+    // rotates with a new Fusion build, not between launches. Anything that
+    // looks like a normal vendor/java package is left alone even if the
+    // signature matches, so unrelated SDKs keep their own answers.
+    static const char* kKeep[] = {
+        "android.", "java.", "javax.", "dalvik.", "kotlin.",
+        "com.", "org.", "net.", "io.", "androidx."
+    };
+    bool skip = false;
+    for (const char* k : kKeep) {
+        if (strncmp(cn, k, strlen(k)) == 0) { skip = true; break; }
+    }
+    bool appdome = !skip && cn[0] != '\0';
+
+    JNINativeMethod local[64];
+    JNINativeMethod* arr = local;
+    if (n > 64) {
+        arr = (JNINativeMethod*) malloc(sizeof(JNINativeMethod) * (size_t) n);
+        if (!arr) return g_origRegNatives(env, cls, methods, n);
+    }
+    memcpy(arr, methods, sizeof(JNINativeMethod) * (size_t) n);
+
+    int swapped = 0;
+    bool announce = (appdome || firstTime(cn)) && g_jniLog.fetch_add(1) < 200;
+    for (jint i = 0; i < n; i++) {
+        const char* nm  = methods[i].name ? methods[i].name : "?";
+        const char* sig = methods[i].signature ? methods[i].signature : "";
+        if (announce) {
+            char b[360];
+            snprintf(b, sizeof(b), "%s %s%s", cn[0] ? cn : "?", nm, sig);
+            nlogCrit("jni", b);
+        }
+        if (appdome && strcmp(sig, "([Ljava/lang/String;)[Z") == 0) {
+            arr[i].fnPtr = (void*) stubThreatState;
+            swapped++;
+        }
+    }
+
+    jint rc = g_origRegNatives(env, cls, arr, n);
+    if (swapped) {
+        char b[240];
+        snprintf(b, sizeof(b), "threat-state forced clean n=%d rc=%d class=%s",
+                 swapped, (int) rc, cn);
+        nlogCrit("jni", b);
+    }
+    if (arr != local) free(arr);
+    return rc;
+}
+
+void installJniBridge() {
+    if (g_origRegNatives) return;
+    JNIEnv* env = nullptr;
+    if (!g_vm || g_vm->GetEnv((void**) &env, JNI_VERSION_1_6) != JNI_OK || !env) {
+        nlogCrit("jni", "no env at install");
+        return;
+    }
+    void** vt = *(void***) env;
+    if (!vt) { nlogCrit("jni", "no function table"); return; }
+
+    typedef jint (*getVmFn)(JNIEnv*, JavaVM**);
+    getVmFn gv = (getVmFn) vt[219];
+    JavaVM* probe = nullptr;
+    if (!gv || gv(env, &probe) != JNI_OK || probe != g_vm) {
+        nlogCrit("jni", "table probe failed");
+        return;
+    }
+    if (vt[215] == (void*) hookRegNatives) return;
+
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) page = 4096;
+    uintptr_t slot = (uintptr_t) &vt[215];
+    void* pg = (void*) (slot & ~(uintptr_t) (page - 1));
+    if (mprotect(pg, (size_t) page, PROT_READ | PROT_WRITE) != 0) {
+        char b[80];
+        snprintf(b, sizeof(b), "mprotect errno=%d", errno);
+        nlogCrit("jni", b);
+        return;
+    }
+    g_origRegNatives = (regNativesFn) vt[215];
+    vt[215] = (void*) hookRegNatives;
+    nlogCrit("hook", "JNI RegisterNatives");
+}
+
 } // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -1554,6 +1701,10 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     nlogRaw("install", head);
 
     installCrashHandler();
+
+    // Before anything loads AppDome's libloader: own the RegisterNatives slot
+    // so its native bridge is rewritten at bind time, not after the verdict.
+    installJniBridge();
 
     pthread_t th;
     if (pthread_create(&th, nullptr, hbThread, nullptr) == 0) pthread_detach(th);
