@@ -554,7 +554,7 @@ jobs:
                       '            top.niunaijun.blackbox.util.OfxLog.log("finishActivity keep=" + keep);\n'
                       "            if (keep) {\n"
                       '                top.niunaijun.blackbox.util.OfxLog.log("finishActivity dropped");\n'
-                      "                return null;\n"
+                      "                return method.getReturnType() == boolean.class ? Boolean.FALSE : null;\n"
                       "            }\n"
                       "            return method.invoke(who, args);\n"
                       "        }\n"
@@ -571,7 +571,7 @@ jobs:
                       '            top.niunaijun.blackbox.util.OfxLog.log("finishAffinity keep=" + keep);\n'
                       "            if (keep) {\n"
                       '                top.niunaijun.blackbox.util.OfxLog.log("finishAffinity dropped");\n'
-                      "                return null;\n"
+                      "                return method.getReturnType() == boolean.class ? Boolean.FALSE : null;\n"
                       "            }\n"
                       "            return method.invoke(who, args);\n"
                       "        }\n"
@@ -588,7 +588,7 @@ jobs:
                       '            top.niunaijun.blackbox.util.OfxLog.log("finishSub keep=" + keep);\n'
                       "            if (keep) {\n"
                       '                top.niunaijun.blackbox.util.OfxLog.log("finishSub dropped");\n'
-                      "                return null;\n"
+                      "                return method.getReturnType() == boolean.class ? Boolean.FALSE : null;\n"
                       "            }\n"
                       "            return method.invoke(who, args);\n"
                       "        }\n"
@@ -642,7 +642,7 @@ jobs:
                       '            top.niunaijun.blackbox.util.OfxLog.log("finishRemoveTask keep=" + keep);\n'
                       "            if (keep) {\n"
                       '                top.niunaijun.blackbox.util.OfxLog.log("finishRemoveTask dropped");\n'
-                      "                return null;\n"
+                      "                return method.getReturnType() == boolean.class ? Boolean.FALSE : null;\n"
                       "            }\n"
                       "            return method.invoke(who, args);\n"
                       "        }\n"
@@ -691,8 +691,8 @@ jobs:
                       '            top.niunaijun.blackbox.util.OfxLog.log("clientFinish keep=" + keep\n'
                       '                    + " argc=" + (args == null ? 0 : args.length));\n'
                       "            if (keep) {\n"
-                      '                top.niunaijun.blackbox.util.OfxLog.log("clientFinish dropped");\n'
-                      "                return null;\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("clientFinish dropped rt=" + method.getReturnType().getName());\n'
+                      "                return method.getReturnType() == boolean.class ? Boolean.FALSE : null;\n"
                       "            }\n"
                       "            IBinder token = (IBinder) args[0];\n"
                       "            BActivityManager.get().onFinishActivity(token);\n"
@@ -725,8 +725,8 @@ jobs:
                       "            } catch (Throwable ignored) { }\n"
                       '            top.niunaijun.blackbox.util.OfxLog.log("commonFinish keep=" + keep);\n'
                       "            if (keep) {\n"
-                      '                top.niunaijun.blackbox.util.OfxLog.log("commonFinish dropped");\n'
-                      "                return null;\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("commonFinish dropped rt=" + method.getReturnType().getName() + " name=" + method.getName());\n'
+                      "                return method.getReturnType() == boolean.class ? Boolean.FALSE : null;\n"
                       "            }\n"
                       "            BlackBoxCore.getBActivityManager().onFinishActivity((IBinder) args[0]);\n"
                       "            return method.invoke(who, args);\n"
@@ -905,6 +905,7 @@ jobs:
                       '        OfxLog.log("Activity.onCreate " + activity.getClass().getName());',
                       '        OfxLog.log("Activity.onCreate " + activity.getClass().getName());\n'
                       "        if (ofxAtmForced == 0\n"
+                      "                && top.niunaijun.blackbox.app.BActivityThread.getAppConfig() != null\n"
                       "                && top.niunaijun.blackbox.util.OfxPatch.keepAlive()) {\n"
                       "            ofxAtmForced = 1;\n"
                       "            try {\n"

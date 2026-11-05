@@ -54,9 +54,21 @@ public final class OfxLog {
         }
         installed = true;
 
+        final Thread.UncaughtExceptionHandler prev =
+                Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
             write("CRASH " + t.getName() + " -> " + e);
             write(stack(e));
+            // Chain to whoever owned the slot before us (Crashlytics, Unity):
+            // replacing their handler silently loses both the report and the
+            // process-level behaviour they install.
+            if (prev != null) {
+                try {
+                    prev.uncaughtException(t, e);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
             Process.killProcess(Process.myPid());
         });
 

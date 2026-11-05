@@ -143,6 +143,16 @@ void nlogRaw(const char* tag, const char* detail) {
     rawWrite(line, (size_t)n);
 }
 
+// Terminal-path records must never be dropped by the trace budget: an empty
+// killblock line is indistinguishable from "the hook was never reached".
+void nlogCrit(const char* tag, const char* detail) {
+    char line[900];
+    int n = snprintf(line, sizeof(line), "%d %s %s\n", (int)getpid(), tag, detail ? detail : "");
+    if (n <= 0) return;
+    if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
+    rawWrite(line, (size_t)n);
+}
+
 uint32_t fnv(const char* s) {
     uint32_t h = 2166136261u;
     while (s && *s) { h ^= (uint32_t)(unsigned char)*s++; h *= 16777619u; }
@@ -211,6 +221,21 @@ void traceLib(const char* tag, const char* s, void* ret) {
 
 void logJavaStack();
 
+// prio is ANDROID_LOG_*: UNKNOWN=0, DEFAULT=1, VERBOSE=2, DEBUG=3,
+// INFO=4, WARN=5, ERROR=6, FATAL=7. The old table indexed from 0 and
+// turned every DEBUG line into W.
+static char prioChar(int prio) {
+    switch (prio) {
+        case 2: return 'V';
+        case 3: return 'D';
+        case 4: return 'I';
+        case 5: return 'W';
+        case 6: return 'E';
+        case 7: return 'F';
+        default: return '?';
+    }
+}
+
 void emitLogLine(int prio, const char* tag, const char* msg) {
     if (!tag || !msg) return;
     if (strncmp(tag, "ofx-harden", 10) == 0) return;
@@ -224,7 +249,7 @@ void emitLogLine(int prio, const char* tag, const char* msg) {
     if (n > 300) n = 300;
     char b[420];
     int w = snprintf(b, sizeof(b), "%d log %c/%s: %.*s\n", (int)getpid(),
-                     "VDIWEFXX"[prio & 7], tag, (int)n, msg);
+                     prioChar(prio), tag, (int)n, msg);
     if (w > 0) rawWrite(b, (size_t)(w > (int)sizeof(b) - 1 ? sizeof(b) - 1 : w));
 }
 
@@ -1251,7 +1276,7 @@ void exitCommon(int code, exitFn orig, const char* name) {
     if (modeOn(M_NOEXIT)) {
         char b[160];
         snprintf(b, sizeof(b), "self %s(%d) swallowed", name, code);
-        nlogRaw("killblock", b);
+        nlogCrit("killblock", b);
         return;
     }
     if (orig) orig(code);
@@ -1275,7 +1300,7 @@ void hookJvmExit(int code) {
     if (modeOn(M_NOEXIT)) {
         char b[96];
         snprintf(b, sizeof(b), "JVM_Exit(%d) swallowed", code);
-        nlogRaw("killblock", b);
+        nlogCrit("killblock", b);
         return;
     }
     if (origJvmExit) origJvmExit(code);
@@ -1285,7 +1310,7 @@ void hookJvmHalt(int code) {
     if (modeOn(M_NOEXIT)) {
         char b[96];
         snprintf(b, sizeof(b), "JVM_Halt(%d) swallowed", code);
-        nlogRaw("killblock", b);
+        nlogCrit("killblock", b);
         return;
     }
     if (origJvmHalt) origJvmHalt(code);
@@ -1295,7 +1320,7 @@ void hookAndroidRuntimeExit(void* self, int code) {
     if (modeOn(M_NOEXIT)) {
         char b[112];
         snprintf(b, sizeof(b), "AndroidRuntime::exit(%d) swallowed", code);
-        nlogRaw("killblock", b);
+        nlogCrit("killblock", b);
         return;
     }
     if (origAndroidRuntimeExit) origAndroidRuntimeExit(self, code);
@@ -1578,13 +1603,26 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         patch("_exit", (void*)hookExitRaw,   (void**)&origExitRaw,   "_exit");
         patch("_Exit", (void*)hookExitUpper, (void**)&origExitUpper, "_Exit");
 
+        // stage: 1 = no handle, 2 = handle but no symbol, 3 = Dobby refused.
+        int arStage = 0;
         void* ar = symLib("libandroid_runtime.so", "_ZN7android14AndroidRuntime4exitEi");
-        if (!ar) ar = sym("_ZN7android14AndroidRuntime4exitEi");
-        if (ar && DobbyHook(ar, (void*)hookAndroidRuntimeExit,
-                            (void**)&origAndroidRuntimeExit) == 0) {
-            nlogRaw("hook", "AndroidRuntime::exit");
-        } else {
-            nlogRaw("miss", "AndroidRuntime::exit");
+        if (!ar) { arStage = 1; ar = sym("_ZN7android14AndroidRuntime4exitEi"); }
+        if (ar) {
+            if (DobbyHook(ar, (void*)hookAndroidRuntimeExit,
+                          (void**)&origAndroidRuntimeExit) == 0) {
+                nlogCrit("hook", "AndroidRuntime::exit");
+            } else {
+                arStage = 3;
+            }
+        } else if (arStage == 0) {
+            arStage = 2;
+        }
+        if (arStage) {
+            const char* e = dlerror();
+            char b[200];
+            snprintf(b, sizeof(b), "AndroidRuntime::exit stage=%d err=%s",
+                     arStage, e ? e : "-");
+            nlogCrit("miss", b);
         }
 
         void* jvm = dlopen("libopenjdkjvm.so", RTLD_NOW);
@@ -1602,7 +1640,10 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
                 nlogRaw("miss", "JVM_Halt");
             }
         } else {
-            nlogRaw("miss", "libopenjdkjvm");
+            const char* e = dlerror();
+            char b[240];
+            snprintf(b, sizeof(b), "libopenjdkjvm err=%s", e ? e : "-");
+            nlogCrit("miss", b);
         }
     } else {
         nlogRaw("skip", "exit group");
