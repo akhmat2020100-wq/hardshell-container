@@ -319,6 +319,7 @@ public final class OfxPatch {
 
     private static void setField(Class<?> cls, Object target, String name, Object value) {
         Class<?> c = cls;
+        while (c != null) {
             try {
                 java.lang.reflect.Field f = c.getDeclaredField(name);
                 f.setAccessible(true);
