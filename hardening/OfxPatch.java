@@ -366,6 +366,82 @@ public final class OfxPatch {
         }
     }
 
+    /**
+     * One line per distinct identity query that reaches a system service.
+     *
+     * Every call the guest makes to PackageManager/ActivityManager lands in
+     * ClassInvocationStub.invoke before it is proxied. The checks that decide
+     * "this is a container" are made of exactly these questions - who owns
+     * this uid, what does this package's ApplicationInfo say, is some known
+     * host package installed - so the argument plus the caller stack is the
+     * cheapest place to see the decision being made. Nothing is answered
+     * differently here.
+     */
+    public static void noteCall(String name, Object[] args) {
+        if (name == null) {
+            return;
+        }
+        switch (name) {
+            case "getPackageInfo":
+            case "getApplicationInfo":
+            case "getInstalledPackages":
+            case "getInstalledApplications":
+            case "getPackageUid":
+            case "getPackagesForUid":
+            case "getNameForUid":
+            case "getNamesForUids":
+            case "resolveIntent":
+            case "queryIntentActivities":
+            case "checkSignatures":
+            case "getInstallerPackageName":
+                break;
+            default:
+                return;
+        }
+        String a0 = "";
+        try {
+            if (args != null && args.length > 0 && args[0] != null) {
+                a0 = String.valueOf(args[0]);
+            }
+        } catch (Throwable ignored) {
+        }
+        if (a0.length() > 120) {
+            a0 = a0.substring(0, 120);
+        }
+        String key = name + "|" + a0;
+        synchronized (pmSeen) {
+            if (pmSeen.size() >= 240 || !pmSeen.add(key)) {
+                return;
+            }
+        }
+        OfxLog.log("pm " + name + " " + a0 + " @ " + callStack());
+    }
+
+    private static final java.util.HashSet<String> pmSeen = new java.util.HashSet<String>();
+
+    private static String callStack() {
+        try {
+            StackTraceElement[] st = new Throwable().getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            for (StackTraceElement e : st) {
+                String cn = e.getClassName();
+                if (cn == null || cn.startsWith("top.niunaijun.blackbox.util.OfxPatch")) {
+                    continue;
+                }
+                if (sb.length() > 0) {
+                    sb.append(" < ");
+                }
+                sb.append(cn).append('.').append(e.getMethodName());
+                if (sb.length() > 200) {
+                    break;
+                }
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
     private static volatile int keepFlag = -1;
     private static volatile String[] blockList;    /** hardbox-keepalive.txt present: drop activity-finish requests. */
     public static boolean keepAlive() {

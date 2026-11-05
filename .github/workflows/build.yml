@@ -530,6 +530,21 @@ jobs:
                       "identity names diag")
               wr(p, s)
 
+          # ---------- service-call observer: who asks whose identity ----------
+          # Every guest binder call to a system service passes through this
+          # dispatcher before it is proxied. The PackageManager / ActivityManager
+          # questions - package info, uid ownership, installed packages - are how
+          # a "virtualized environment" verdict is assembled, so each distinct
+          # (method, first argument) gets one line with its caller stack.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/hook/ClassInvocationStub.java"
+          s = rd(p)
+          if "OfxPatch.noteCall" not in s:
+              s = sub(s, "        MethodHook methodHook = mMethodHookMap.get(method.getName());",
+                      "        top.niunaijun.blackbox.util.OfxPatch.noteCall(method.getName(), args);\n"
+                      "        MethodHook methodHook = mMethodHookMap.get(method.getName());",
+                      "invoke observer")
+              wr(p, s)
+
           # ---------- activity_task: block the verdict's second act ----------
           # Swallowing SIGKILL only removes the executioner. The SDK then asks
           # the server to finish the Unity activity, which destroys the window.

@@ -80,6 +80,7 @@ enum {
     M_NOKILL    = 131072, // ...and swallow a self-directed SIGKILL instead of dying
     M_NOEXIT    = 262144, // swallow self exit()/_exit(), the verdict's second act
     M_PROPTRACE = 524288, // log every ro.* property and prop_info the guest asks for
+    M_SYS       = 1048576,// trace libc syscall() calls made by the packer library
     H_PROP      = 128,
     H_OPEN      = 256,
     H_STAT      = 512,
@@ -216,6 +217,92 @@ void traceLib(const char* tag, const char* s, void* ret) {
     char b[512];
     snprintf(b, sizeof(b), "%s @%s", s, lib[0] ? lib : "?");
     nlogRaw(tag, b);
+}
+
+// ---------------------------------------------------------------------------
+// Raw-syscall observer for the packer.
+//
+// libloader.so imports libc's syscall() and reaches the filesystem through it:
+// across three runs and 100k+ intercepted JNI calls, not one open/stat/access
+// from that library ever reached the libc hooks - while the same library calls
+// __system_property_get straight through the PLT, so the hooks do see it. A
+// protector that owns syscall() can read /proc/self/maps, /proc/self/status or
+// any /data path without a single interceptable libc frame, which is exactly
+// the blind spot every file hook so far has been shouting about.
+//
+// The hook sits on libc's syscall() itself, attributes the call by return
+// address and records the path argument where the syscall carries one.
+// Nothing is rewritten in this build: it measures.
+// ---------------------------------------------------------------------------
+typedef long (*syscallFn)(long, ...);
+static syscallFn g_origSyscall = nullptr;
+static thread_local int t_inSyscall = 0;
+std::atomic<int> g_sysSeen{0};
+
+// Syscalls that carry a path pointer, and where that pointer sits.
+static bool sysHasPath(long nr) {
+    switch (nr) {
+        case 56:   // openat(dirfd, path, flags, mode)
+        case 48:   // faccessat(dirfd, path, mode)
+        case 439:  // faccessat2(dirfd, path, mode, flags)
+        case 437:  // openat2(dirfd, path, how, size)
+        case 78:   // readlinkat(dirfd, path, buf, size)
+        case 79:   // newfstatat(dirfd, path, statbuf, flags)
+        case 291:  // statx(dirfd, path, flags, mask, buf)
+        case 281:  // execveat(dirfd, path, argv, envp, flags)
+        case 221:  // execve(path, argv, envp)
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Numbers worth one line even without a path: directory walks and the three
+// ways to end a process are how a scan and its verdict look from down here.
+static bool sysInteresting(long nr) {
+    switch (nr) {
+        case 61:   // getdents64
+        case 129:  // kill
+        case 131:  // tgkill
+        case 117:  // ptrace
+            return true;
+        default:
+            return sysHasPath(nr);
+    }
+}
+
+static long hookSyscall(long nr, ...) {
+    va_list ap;
+    va_start(ap, nr);
+    long a[6];
+    for (int i = 0; i < 6; i++) a[i] = va_arg(ap, long);
+    va_end(ap);
+
+    if (!g_origSyscall) return -1;
+    if (t_inSyscall || !sysInteresting(nr))
+        return g_origSyscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+
+    t_inSyscall = 1;
+    char lib[140];
+    libOf(__builtin_return_address(0), lib, sizeof(lib));
+    if (strstr(lib, "libloader") != nullptr) {
+        const char* p = nullptr;
+        if (sysHasPath(nr)) p = (const char*) (nr == 221 ? a[0] : a[1]);
+        char key[320];
+        if (p) snprintf(key, sizeof(key), "s%d|%.240s", (int) nr, p);
+        else   snprintf(key, sizeof(key), "s%d|%ld|%ld", (int) nr, a[0], a[1]);
+        if (firstTime(key)) {
+            g_sysSeen.fetch_add(1);
+            char b[460];
+            if (p) snprintf(b, sizeof(b), "nr=%d %.230s @%s", (int) nr, p, lib);
+            else   snprintf(b, sizeof(b), "nr=%d a0=%ld a1=%ld @%s",
+                            (int) nr, a[0], a[1], lib);
+            nlogCrit("sys", b);
+        }
+    }
+    t_inSyscall = 0;
+
+    return g_origSyscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
 }
 
 void logJavaStack();
@@ -1755,8 +1842,8 @@ static jobject JNICALL hookStObjA(JNIEnv* env, jclass c, jmethodID m, const jval
 std::atomic<int> g_identHits{0};
 
 static void jniStrStats(char* out, size_t cap) {
-    snprintf(out, cap, "strCalls=%d hits=%d ident=%d",
-             g_strCalls.load(), g_strHits.load(), g_identHits.load());
+    snprintf(out, cap, "strCalls=%d hits=%d ident=%d sys=%d",
+             g_strCalls.load(), g_strHits.load(), g_identHits.load(), g_sysSeen.load());
 }
 
 // ---------------------------------------------------------------------------
@@ -2069,6 +2156,14 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         }
     } else {
         nlogRaw("skip", "exit group");
+    }
+
+    // The packer's own filesystem access never passes through libc wrappers;
+    // it takes libc's syscall() instead. This is the only frame it leaves.
+    if (modeOn(M_SYS)) {
+        patch("syscall", (void*) hookSyscall, (void**) &g_origSyscall, "syscall");
+    } else {
+        nlogRaw("skip", "syscall group");
     }
 
     {
