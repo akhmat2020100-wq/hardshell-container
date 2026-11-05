@@ -1630,13 +1630,15 @@ static jint JNICALL hookRegNatives(JNIEnv* env, jclass cls,
 // ---------------------------------------------------------------------------
 typedef jobject (*callObjVFn)(JNIEnv*, jobject, jmethodID, va_list);
 typedef jobject (*callObjAFn)(JNIEnv*, jobject, jmethodID, const jvalue*);
+typedef jobject (*callNvObjVFn)(JNIEnv*, jobject, jclass, jmethodID, va_list);
+typedef jobject (*callNvObjAFn)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*);
 typedef jobject (*callStObjVFn)(JNIEnv*, jclass, jmethodID, va_list);
 typedef jobject (*callStObjAFn)(JNIEnv*, jclass, jmethodID, const jvalue*);
 
 static callObjVFn   g_origObjV   = nullptr;
 static callObjAFn   g_origObjA   = nullptr;
-static callObjVFn   g_origNvObjV = nullptr;
-static callObjAFn   g_origNvObjA = nullptr;
+static callNvObjVFn g_origNvObjV = nullptr;
+static callNvObjAFn g_origNvObjA = nullptr;
 static callStObjVFn g_origStObjV = nullptr;
 static callStObjAFn g_origStObjA = nullptr;
 static jclass       g_strCls     = nullptr;
