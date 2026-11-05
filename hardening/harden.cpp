@@ -93,7 +93,6 @@ std::atomic<int>  g_budget{30000};
 std::atomic<int>  g_lcatBudget{60000};
 // One-shot: the first time the SDK logs its package verdict, photograph the
 // stack that asked for it. Reading the client tells us nothing; the caller does.
-std::atomic<bool> g_pkgTrace{false};
 std::atomic<bool> g_dexDump{false};
 std::atomic<bool> g_hbStop{false};
 
@@ -240,12 +239,11 @@ static char prioChar(int prio) {
 void emitLogLine(int prio, const char* tag, const char* msg) {
     if (!tag || !msg) return;
     if (strncmp(tag, "ofx-harden", 10) == 0) return;
-    // The SDK announces the verdict with the package name it decided we are.
-    // Whatever produced that string is the leak - trace it once, at the source.
-    if (strstr(msg, "getPackageName") && strstr(tag, "Kumiho") && !g_pkgTrace.exchange(true)) {
-        logJavaStack();
-        nativeStack();
-    }
+    // Kumiho is Samsung's graphics decoder (/system/lib64/libkumiho.so), not
+    // the guest's anti-tamper: it logs the host package because it lives in
+    // the host process and asks who it is running under. Its policy file
+    // (/system/etc/kumiho/Kumiho.policy) is a list of social apps to optimise.
+    // Taking that line as the leak sent several builds after the wrong thing.
     if (g_lcatBudget.fetch_sub(1) <= 0) return;
     size_t n = strlen(msg);
     if (n > 300) n = 300;
@@ -1754,9 +1752,99 @@ static jobject JNICALL hookStObjA(JNIEnv* env, jclass c, jmethodID m, const jval
 // Read by the heartbeat so one log line tells us whether the object-return
 // hooks are in the path at all. calls==0 means native never used these slots
 // and the leak reaches Kumiho by some other route.
+std::atomic<int> g_identHits{0};
+
 static void jniStrStats(char* out, size_t cap) {
-    snprintf(out, cap, "strCalls=%d hits=%d",
-             g_strCalls.load(), g_strHits.load());
+    snprintf(out, cap, "strCalls=%d hits=%d ident=%d",
+             g_strCalls.load(), g_strHits.load(), g_identHits.load());
+}
+
+// ---------------------------------------------------------------------------
+// Identity-string observer: the slots that actually hand a package name to
+// native code.
+//
+// Kumiho turned out to be Samsung's graphics decoder, so its log line was
+// noise. What is still unexplained is how the guest decides we are a
+// container. These hooks watch the three ways a native caller can obtain a
+// host-looking string without any object-returning call:
+//
+//   167 NewStringUTF       - string built in C and pushed into Java
+//   169 GetStringUTFChars  - string fetched earlier, materialised now
+//   95  GetObjectField     - ApplicationInfo.packageName / dataDir / sourceDir
+//   145 GetStaticObjectField - ActivityThread.mBoundApplication, Build fields
+//
+// Matches are logged with the calling library so a hit names its own source.
+// Nothing is rewritten here: this run is measurement, not masking.
+// ---------------------------------------------------------------------------
+typedef jstring (*newStrUtfFn)(JNIEnv*, const char*);
+typedef const char* (*getStrUtfFn)(JNIEnv*, jstring, jboolean*);
+typedef jobject (*getObjFieldFn)(JNIEnv*, jobject, jfieldID);
+typedef jobject (*getStObjFieldFn)(JNIEnv*, jclass, jfieldID);
+
+static newStrUtfFn    g_origNewStrUtf  = nullptr;
+static getStrUtfFn    g_origGetStrUtf  = nullptr;
+static getObjFieldFn  g_origGetObjFld  = nullptr;
+static getStObjFieldFn g_origGetStObjFld = nullptr;
+
+static bool identityish(const char* s) {
+    if (!s) return false;
+    return strstr(s, "niunaijun") != nullptr ||
+           strstr(s, "blackbox")  != nullptr;
+}
+
+static void noteIdentity(const char* where, const char* s, void* ret) {
+    if (!identityish(s)) return;
+    int n = g_identHits.fetch_add(1);
+    if (n >= 40) return;
+    char lib[96];
+    libOf(ret, lib, sizeof(lib));
+    char b[420];
+    snprintf(b, sizeof(b), "%s caller=%s val=%.220s", where,
+             lib[0] ? lib : "?", s);
+    nlogCrit("ident", b);
+}
+
+static jstring JNICALL hookNewStrUtf(JNIEnv* env, const char* s) {
+    if (!g_origNewStrUtf) return nullptr;
+    noteIdentity("NewStringUTF", s, __builtin_return_address(0));
+    return g_origNewStrUtf(env, s);
+}
+
+static const char* JNICALL hookGetStrUtf(JNIEnv* env, jstring js, jboolean* isCopy) {
+    if (!g_origGetStrUtf) return nullptr;
+    const char* r = g_origGetStrUtf(env, js, isCopy);
+    if (r) noteIdentity("GetStringUTFChars", r, __builtin_return_address(0));
+    return r;
+}
+
+static jobject JNICALL hookGetObjFld(JNIEnv* env, jobject o, jfieldID f) {
+    if (!g_origGetObjFld) return nullptr;
+    jobject r = g_origGetObjFld(env, o, f);
+    if (r && g_strCls && env->IsInstanceOf(r, g_strCls)) {
+        const char* c = g_origGetStrUtf ? g_origGetStrUtf(env, (jstring) r, nullptr) : nullptr;
+        if (c) {
+            noteIdentity("GetObjectField", c, __builtin_return_address(0));
+            env->ReleaseStringUTFChars((jstring) r, c);
+        } else {
+            env->ExceptionClear();
+        }
+    }
+    return r;
+}
+
+static jobject JNICALL hookGetStObjFld(JNIEnv* env, jclass k, jfieldID f) {
+    if (!g_origGetStObjFld) return nullptr;
+    jobject r = g_origGetStObjFld(env, k, f);
+    if (r && g_strCls && env->IsInstanceOf(r, g_strCls)) {
+        const char* c = g_origGetStrUtf ? g_origGetStrUtf(env, (jstring) r, nullptr) : nullptr;
+        if (c) {
+            noteIdentity("GetStaticObjectField", c, __builtin_return_address(0));
+            env->ReleaseStringUTFChars((jstring) r, c);
+        } else {
+            env->ExceptionClear();
+        }
+    }
+    return r;
 }
 
 // One page covers every slot above (highest is 116, byte offset 928).
@@ -1814,6 +1902,10 @@ void installJniBridge() {
     ok &= patchSlot(vt, 66,  (void*) hookNvObjA, (void**) &g_origNvObjA, "CallNonvirtualObjectMethodA");
     ok &= patchSlot(vt, 115, (void*) hookStObjV, (void**) &g_origStObjV, "CallStaticObjectMethodV");
     ok &= patchSlot(vt, 116, (void*) hookStObjA, (void**) &g_origStObjA, "CallStaticObjectMethodA");
+    ok &= patchSlot(vt, 167, (void*) hookNewStrUtf,   (void**) &g_origNewStrUtf,   "NewStringUTF");
+    ok &= patchSlot(vt, 169, (void*) hookGetStrUtf,   (void**) &g_origGetStrUtf,   "GetStringUTFChars");
+    ok &= patchSlot(vt, 95,  (void*) hookGetObjFld,   (void**) &g_origGetObjFld,   "GetObjectField");
+    ok &= patchSlot(vt, 145, (void*) hookGetStObjFld, (void**) &g_origGetStObjFld, "GetStaticObjectField");
 
     nlogCrit("hook", "JNI RegisterNatives");
     char b[200];
