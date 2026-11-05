@@ -1900,13 +1900,6 @@ static jstring JNICALL hookNewStrUtf(JNIEnv* env, const char* s) {
     return g_origNewStrUtf(env, s);
 }
 
-static const char* JNICALL hookGetStrUtf(JNIEnv* env, jstring js, jboolean* isCopy) {
-    if (!g_origGetStrUtf) return nullptr;
-    const char* r = g_origGetStrUtf(env, js, isCopy);
-    if (r) noteIdentity("GetStringUTFChars", r, __builtin_return_address(0));
-    return r;
-}
-
 static jobject JNICALL hookGetObjFld(JNIEnv* env, jobject o, jfieldID f) {
     if (!g_origGetObjFld) return nullptr;
     jobject r = g_origGetObjFld(env, o, f);
@@ -1937,7 +1930,138 @@ static jobject JNICALL hookGetStObjFld(JNIEnv* env, jclass k, jfieldID f) {
     return r;
 }
 
-// One page covers every slot above (highest is 116, byte offset 928).
+// ---------------------------------------------------------------------------
+// Packer-facing class-name mask.
+//
+// libloader.so walks the Java stack during bindApplication and reads every
+// frame through GetStringUTFChars: BaseInstrumentationDelegate,
+// AppInstrumentation, Reflector.callByCaller, BlackReflection$1.invoke,
+// BActivityThread.handleBindApplication, HCallbackProxy.handleLaunchActivity.
+// That is a sandbox fingerprint made of class names, and the whole BlackBox
+// instrumentation chain is in it.
+//
+// The mask is scoped to callers inside the app's own native directory - the
+// same binding calls made by libblackbox.so (our own observer) and the runtime
+// keep their real strings, so nothing in the container's machinery changes.
+// Returned buffers are heap-owned and ReleaseStringUTFChars is hooked, so the
+// caller's release frees our copy instead of the VM's.
+// ---------------------------------------------------------------------------
+typedef void (*releaseStrUtfFn)(JNIEnv*, jstring, const char*);
+static releaseStrUtfFn g_origReleaseStrUtf = nullptr;
+static std::mutex g_maskMu;
+static const char* g_maskPtrs[512];
+static int g_maskCount = 0;
+static std::atomic<int> g_maskHits{0};
+
+static bool packerCaller(void* ret) {
+    char lib[200];
+    libOf(ret, lib, sizeof(lib));
+    return strstr(lib, "libloader.so") != nullptr ||
+           strstr(lib, "libappdome") != nullptr ||
+           strstr(lib, "libfusion") != nullptr;
+}
+
+// Class names only. Paths are left alone in this build: a rewritten dataDir
+// that libloader later opens would fail for a reason that is not the check.
+static bool maskable(const char* s) {
+    return s && strncmp(s, "top.niunaijun", 13) == 0;
+}
+
+struct MaskRule {
+    const char* from;
+    const char* to;
+};
+
+static const MaskRule kMaskRules[] = {
+    {"top.niunaijun.blackbox.app.BActivityThread",       "android.app.ActivityThread"},
+    {"top.niunaijun.blackbox.fake.service.HCallbackProxy", "android.os.Handler"},
+    {"top.niunaijun.blackbox.fake.service.IActivityManagerProxy", "android.app.ActivityManager"},
+    {"top.niunaijun.blackbox.fake.delegate.AppInstrumentation", "android.app.Instrumentation"},
+    {"top.niunaijun.blackbox.fake.delegate.BaseInstrumentationDelegate", "android.app.Instrumentation"},
+    {"top.niunaijun.blackreflection.",                   "java.lang.reflect."},
+    {"top.niunaijun.blackbox.",                          "android.app."},
+    {"top.niunaijun.",                                   "android."},
+    {"niunaijun",                                        "android"},
+    {"blackbox",                                         "android"},
+};
+
+static const char* maskCopy(const char* s) {
+    size_t n = strlen(s);
+    char* out = (char*) malloc(n + 64);
+    if (!out) return s;
+    size_t o = 0;
+    for (size_t i = 0; i < n; ) {
+        bool hit = false;
+        for (const MaskRule& r : kMaskRules) {
+            size_t fl = strlen(r.from);
+            if (strncmp(s + i, r.from, fl) == 0) {
+                size_t tl = strlen(r.to);
+                memcpy(out + o, r.to, tl);
+                o += tl;
+                i += fl;
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) out[o++] = s[i++];
+    }
+    out[o] = 0;
+    return out;
+}
+
+static void trackMasked(const char* p) {
+    std::lock_guard<std::mutex> lk(g_maskMu);
+    if (g_maskCount < (int) (sizeof(g_maskPtrs) / sizeof(g_maskPtrs[0]))) {
+        g_maskPtrs[g_maskCount++] = p;
+    }
+}
+
+static bool untrackMasked(const char* p) {
+    std::lock_guard<std::mutex> lk(g_maskMu);
+    for (int i = 0; i < g_maskCount; i++) {
+        if (g_maskPtrs[i] == p) {
+            g_maskPtrs[i] = g_maskPtrs[g_maskCount - 1];
+            g_maskCount--;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void JNICALL hookReleaseStrUtf(JNIEnv* env, jstring js, const char* s) {
+    if (s && untrackMasked(s)) {
+        free((void*) s);
+        return;
+    }
+    if (g_origReleaseStrUtf) g_origReleaseStrUtf(env, js, s);
+}
+
+static const char* JNICALL hookGetStrUtf(JNIEnv* env, jstring js, jboolean* isCopy) {
+    if (!g_origGetStrUtf) return nullptr;
+    const char* r = g_origGetStrUtf(env, js, isCopy);
+    if (!r) return nullptr;
+    void* ret = __builtin_return_address(0);
+    noteIdentity("GetStringUTFChars", r, ret);
+    if (maskable(r) && packerCaller(ret)) {
+        const char* m = maskCopy(r);
+        if (m != r) {
+            trackMasked(m);
+            int n = g_maskHits.fetch_add(1);
+            if (n < 80) {
+                char lib[200];
+                libOf(ret, lib, sizeof(lib));
+                char b[560];
+                snprintf(b, sizeof(b), "mask %.200s -> %.200s @%s", r, m, lib);
+                nlogCrit("mask", b);
+            }
+            return m;
+        }
+    }
+    return r;
+}
+
+// One page covers every identity slot above (highest is 169); Release lives
+// one slot later and gets its own mprotect inside patchSlot.
 static bool patchSlot(void** vt, int slot, void* repl, void** save, const char* what) {
     if (vt[slot] == repl) return true;
     long page = sysconf(_SC_PAGESIZE);
@@ -1994,6 +2118,7 @@ void installJniBridge() {
     ok &= patchSlot(vt, 116, (void*) hookStObjA, (void**) &g_origStObjA, "CallStaticObjectMethodA");
     ok &= patchSlot(vt, 167, (void*) hookNewStrUtf,   (void**) &g_origNewStrUtf,   "NewStringUTF");
     ok &= patchSlot(vt, 169, (void*) hookGetStrUtf,   (void**) &g_origGetStrUtf,   "GetStringUTFChars");
+    ok &= patchSlot(vt, 170, (void*) hookReleaseStrUtf, (void**) &g_origReleaseStrUtf, "ReleaseStringUTFChars");
     ok &= patchSlot(vt, 95,  (void*) hookGetObjFld,   (void**) &g_origGetObjFld,   "GetObjectField");
     ok &= patchSlot(vt, 145, (void*) hookGetStObjFld, (void**) &g_origGetStObjFld, "GetStaticObjectField");
 
