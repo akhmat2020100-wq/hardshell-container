@@ -521,6 +521,8 @@ jobs:
                       '                OfxLog.log("v9 APP diag failed " + t);\n'
                       "            }\n"
                       "            try { top.niunaijun.blackbox.util.OfxPatch.diagNames(mInitialApplication); }\n"
+                      "            catch (Throwable ignored) { }\n"
+                      "            try { top.niunaijun.blackbox.util.OfxPatch.sanitizeHome(mInitialApplication); }\n"
                       "            catch (Throwable ignored) { }",
                       "identity names diag")
               wr(p, s)
@@ -904,6 +906,7 @@ jobs:
               s = sub(s,
                       '        OfxLog.log("Activity.onCreate " + activity.getClass().getName());',
                       '        OfxLog.log("Activity.onCreate " + activity.getClass().getName());\n'
+                      "        top.niunaijun.blackbox.util.OfxPatch.fixContext(activity);\n"
                       "        if (ofxAtmForced == 0\n"
                       "                && top.niunaijun.blackbox.app.BActivityThread.getAppConfig() != null\n"
                       "                && top.niunaijun.blackbox.util.OfxPatch.keepAlive()) {\n"

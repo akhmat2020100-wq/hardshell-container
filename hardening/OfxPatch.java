@@ -248,10 +248,48 @@ public final class OfxPatch {
         }
     }
 
-    private static volatile int keepFlag = -1;
-    private static volatile String[] blockList;
+    /**
+     * Rewrite the package name a guest Context reports. The container builds
+     * the guest ContextImpl from the host process, so getPackageName() can
+     * answer with the host package; integrity checks compare that against the
+     * APK path and read the mismatch as virtualization.
+     */
+    public static void fixContext(android.content.Context c) {
+        if (c == null) {
+            return;
+        }
+        try {
+            String pkg = c.getPackageName();
+            Object impl = c;
+            int guard = 0;
+            while (impl instanceof android.content.ContextWrapper && guard++ < 16) {
+                android.content.Context base =
+                        ((android.content.ContextWrapper) impl).getBaseContext();
+                if (base == null || base == impl) {
+                    break;
+                }
+                impl = base;
+            }
+            Class<?> cls = Class.forName("android.app.ContextImpl");
+            if (!cls.isInstance(impl)) {
+                OfxLog.log("ctxfix not impl=" + (impl == null ? "null"
+                        : impl.getClass().getName()) + " pkg=" + pkg);
+                return;
+            }
+            java.lang.reflect.Field f = cls.getDeclaredField("mBasePackageName");
+            f.setAccessible(true);
+            Object old = f.get(impl);
+            if (pkg != null && !pkg.equals(old)) {
+                f.set(impl, pkg);
+                OfxLog.log("ctxfix mBasePackageName " + old + " -> " + pkg);
+            }
+        } catch (Throwable t) {
+            OfxLog.log("ctxfix failed " + t);
+        }
+    }
 
-    /** hardbox-keepalive.txt present: drop activity-finish requests. */
+    private static volatile int keepFlag = -1;
+    private static volatile String[] blockList;    /** hardbox-keepalive.txt present: drop activity-finish requests. */
     public static boolean keepAlive() {
         int c = keepFlag;
         if (c >= 0) {
