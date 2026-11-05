@@ -1876,17 +1876,20 @@ static getStObjFieldFn g_origGetStObjFld = nullptr;
 static bool identityish(const char* s) {
     if (!s) return false;
     return strstr(s, "niunaijun") != nullptr ||
-           strstr(s, "blackbox")  != nullptr;
+           strstr(s, "blackbox")  != nullptr ||
+           strstr(s, "Virtualized") != nullptr ||
+           strstr(s, "Detected by") != nullptr ||
+           strstr(s, "AppDome") != nullptr;
 }
 
 static void noteIdentity(const char* where, const char* s, void* ret) {
     if (!identityish(s)) return;
     int n = g_identHits.fetch_add(1);
-    if (n >= 40) return;
-    char lib[96];
+    if (n >= 300) return;
+    char lib[200];
     libOf(ret, lib, sizeof(lib));
-    char b[420];
-    snprintf(b, sizeof(b), "%s caller=%s val=%.220s", where,
+    char b[520];
+    snprintf(b, sizeof(b), "%s caller=%s val=%.260s", where,
              lib[0] ? lib : "?", s);
     nlogCrit("ident", b);
 }

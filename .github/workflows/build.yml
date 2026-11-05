@@ -515,6 +515,87 @@ jobs:
                       "IPackageManagerProxy name-for-uid")
               wr(p, s)
 
+          # ---------- host package: stop confirming the container is installed ----------
+          # BPackageManagerService.getPackageInfo has a host branch that proxies
+          # straight to the real PackageManager, so any guest asking about
+          # "top.niunaijun.blackbox" used to get a real PackageInfo back. Answer
+          # "not installed" and log the caller; the returning stack is the map
+          # of who is fingerprinting the container.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/IPackageManagerProxy.java"
+          s = rd(p)
+          if "ofxHostPkgInfo" not in s:
+              s = sub(s,
+                      "            PackageInfo packageInfo = BlackBoxCore.getBPackageManager().getPackageInfo(packageName, flags, BlackBoxCore.getUserId());",
+                      "            if (packageName != null && packageName.equals(BlackBoxCore.getHostPkg())) {\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("ofxHostPkgInfo getPackageInfo " + packageName);\n'
+                      "                return null;\n"
+                      "            }\n"
+                      "            PackageInfo packageInfo = BlackBoxCore.getBPackageManager().getPackageInfo(packageName, flags, BlackBoxCore.getUserId());",
+                      "host pkg getPackageInfo")
+
+              s = sub(s,
+                      "            List<PackageInfo> installedPackages = BlackBoxCore.getBPackageManager().getInstalledPackages(flags, BlackBoxCore.getUserId());\n"
+                      "            return ParceledListSliceCompat.create(installedPackages);",
+                      "            List<PackageInfo> installedPackages = BlackBoxCore.getBPackageManager().getInstalledPackages(flags, BlackBoxCore.getUserId());\n"
+                      "            java.util.ArrayList<PackageInfo> ofxPkgs = new java.util.ArrayList<>();\n"
+                      "            StringBuilder ofxNames = new StringBuilder();\n"
+                      "            int ofxN = 0;\n"
+                      "            for (PackageInfo pi : installedPackages) {\n"
+                      "                if (pi == null || pi.packageName == null) continue;\n"
+                      "                if (pi.packageName.equals(BlackBoxCore.getHostPkg())) continue;\n"
+                      "                ofxPkgs.add(pi);\n"
+                      "                if (ofxN < 24) ofxNames.append(pi.packageName).append(',');\n"
+                      "                ofxN++;\n"
+                      "            }\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("installedPkgs n=" + ofxN + " names=" + ofxNames);\n'
+                      "            return ParceledListSliceCompat.create(ofxPkgs);",
+                      "host pkg getInstalledPackages")
+
+              s = sub(s,
+                      "            List<ApplicationInfo> installedApplications = BlackBoxCore.getBPackageManager().getInstalledApplications(flags, BlackBoxCore.getUserId());\n"
+                      "            return ParceledListSliceCompat.create(installedApplications);",
+                      "            List<ApplicationInfo> installedApplications = BlackBoxCore.getBPackageManager().getInstalledApplications(flags, BlackBoxCore.getUserId());\n"
+                      "            java.util.ArrayList<ApplicationInfo> ofxApps = new java.util.ArrayList<>();\n"
+                      "            StringBuilder ofxAppNames = new StringBuilder();\n"
+                      "            int ofxAn = 0;\n"
+                      "            for (ApplicationInfo ai : installedApplications) {\n"
+                      "                if (ai == null || ai.packageName == null) continue;\n"
+                      "                if (ai.packageName.equals(BlackBoxCore.getHostPkg())) continue;\n"
+                      "                ofxApps.add(ai);\n"
+                      "                if (ofxAn < 24) ofxAppNames.append(ai.packageName).append(',');\n"
+                      "                ofxAn++;\n"
+                      "            }\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("installedApps n=" + ofxAn + " names=" + ofxAppNames);\n'
+                      "            return ParceledListSliceCompat.create(ofxApps);",
+                      "host pkg getInstalledApplications")
+              wr(p, s)
+
+          # ---------- toast provenance: who puts the verdict on screen ----------
+          # The SDK's final act is a Toast. It crosses INotificationManager on its
+          # way to the window manager, so the caller stack here either names the
+          # decrypted Java class or proves the call came from native code. The
+          # toast itself is dropped: it is a report, not the block.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/INotificationManagerProxy.java"
+          s = rd(p)
+          if "ofxToast" not in s:
+              s = sub(s, '    @ProxyMethod("getNotificationChannel")',
+                      '    @ProxyMethod("enqueueToast")\n'
+                      "    public static class OfxToast extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            try {\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("ofxToast pkg="\n'
+                      '                        + (args != null && args.length > 0 ? args[0] : "?")\n'
+                      '                        + " @" + top.niunaijun.blackbox.util.OfxPatch.trace());\n'
+                      "            } catch (Throwable ignored) { }\n"
+                      "            return 0;\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("getNotificationChannel")',
+                      "toast provenance")
+              wr(p, s)
+
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
           if "OfxPatch.diagNames" not in s:

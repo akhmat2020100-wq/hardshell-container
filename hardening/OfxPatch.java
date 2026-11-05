@@ -394,6 +394,15 @@ public final class OfxPatch {
             case "queryIntentActivities":
             case "checkSignatures":
             case "getInstallerPackageName":
+            case "getRunningAppProcesses":
+            case "getRunningTasks":
+            case "getRecentTasks":
+            case "getMyMemoryState":
+            case "getProcessesInErrorState":
+            case "getUidProcessState":
+            case "getAppStartMode":
+            case "getPackageProcessState":
+            case "getRunningServices":
                 break;
             default:
                 return;
@@ -408,16 +417,25 @@ public final class OfxPatch {
         if (a0.length() > 120) {
             a0 = a0.substring(0, 120);
         }
-        String key = name + "|" + a0;
+        int seq;
         synchronized (pmSeen) {
-            if (pmSeen.size() >= 240 || !pmSeen.add(key)) {
+            if (pmCount >= 400) {
                 return;
             }
+            seq = ++pmCount;
         }
-        OfxLog.log("pm " + name + " " + a0 + " @ " + callStack());
+        long ms = android.os.SystemClock.elapsedRealtime() - pmStart;
+        OfxLog.log("pm" + seq + " +" + ms + "ms " + name + " " + a0 + " @ " + callStack());
     }
 
     private static final java.util.HashSet<String> pmSeen = new java.util.HashSet<String>();
+    private static final long pmStart = android.os.SystemClock.elapsedRealtime();
+    private static int pmCount = 0;
+
+    /** Full caller stack for the toast / package observers. */
+    public static String trace() {
+        return callStack();
+    }
 
     private static String callStack() {
         try {
@@ -432,7 +450,7 @@ public final class OfxPatch {
                     sb.append(" < ");
                 }
                 sb.append(cn).append('.').append(e.getMethodName());
-                if (sb.length() > 200) {
+                if (sb.length() > 900) {
                     break;
                 }
             }
