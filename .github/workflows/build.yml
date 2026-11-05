@@ -551,9 +551,44 @@ jobs:
                       "            try {\n"
                       "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive();\n"
                       "            } catch (Throwable ignored) { }\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("finishActivity keep=" + keep);\n'
                       "            if (keep) {\n"
                       '                top.niunaijun.blackbox.util.OfxLog.log("finishActivity dropped");\n'
-                      "                return Boolean.FALSE;\n"
+                      "                return null;\n"
+                      "            }\n"
+                      "            return method.invoke(who, args);\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("finishActivityAffinity")\n'
+                      "    public static class ofxFinishAffinity extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            boolean keep = false;\n"
+                      "            try {\n"
+                      "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive();\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("finishAffinity keep=" + keep);\n'
+                      "            if (keep) {\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("finishAffinity dropped");\n'
+                      "                return null;\n"
+                      "            }\n"
+                      "            return method.invoke(who, args);\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("finishSubActivity")\n'
+                      "    public static class ofxFinishSub extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            boolean keep = false;\n"
+                      "            try {\n"
+                      "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive();\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("finishSub keep=" + keep);\n'
+                      "            if (keep) {\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("finishSub dropped");\n'
+                      "                return null;\n"
                       "            }\n"
                       "            return method.invoke(who, args);\n"
                       "        }\n"

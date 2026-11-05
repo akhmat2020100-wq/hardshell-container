@@ -653,17 +653,15 @@ void dumpDecryptedDex() {
             if (pc > 7) pc = 7;
             memcpy(perms, line.data() + tsp, pc);
             const char* path = "";
-            size_t ps = pe;
-            int fields = 0;
-            while (ps < line.size() && fields < 3) {
-                if (line[ps] == ' ') {
-                    fields++;
-                    while (ps < line.size() && line[ps] == ' ') ps++;
-                } else {
-                    ps++;
-                }
+            size_t q = pe;
+            // maps: start-end perms offset dev inode [path]; step past three
+            // tokens so the path keeps its own spaces ([anon:dalvik-main space]).
+            for (int t = 0; t < 3; t++) {
+                while (q < line.size() && line[q] == ' ') q++;
+                while (q < line.size() && line[q] != ' ') q++;
             }
-            if (ps < line.size()) path = line.c_str() + ps;
+            while (q < line.size() && line[q] == ' ') q++;
+            if (q < line.size()) path = line.c_str() + q;
 
             // Anonymous memory only: disk images are mapped from files and
             // cannot hold the decrypted payload. Free-list holes are fine

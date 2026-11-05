@@ -98,6 +98,8 @@ public final class OfxPatch {
         // Primed here: by the time the app is created, IOCore has redirected
         // /storage/emulated/0 into the container and the flag file is gone.
         homeEnabled();
+        keepAlive();
+        blockedClass(null);
         String mode = modeName();
         OfxLog.log("appMode=" + mode + " src=" + cachedSource + " pkg=" + packageName
                 + " proc=" + processName + " manifestClass=" + info.className);
@@ -140,6 +142,12 @@ public final class OfxPatch {
             }
             OfxLog.log("names pkg=" + app.getPackageName()
                     + " op=" + app.getOpPackageName()
+                    + " ctx=" + (app.getApplicationContext() == null ? "?"
+                        : app.getApplicationContext().getPackageName())
+                    + " base=" + (app.getBaseContext() == null ? "?"
+                        : app.getBaseContext().getClass().getName())
+                    + " basePkg=" + (app.getBaseContext() == null ? "?"
+                        : app.getBaseContext().getPackageName())
                     + " appProc=" + app.getProcessName()
                     + " atProc=" + OfxLog.procName()
                     + " aiProc=" + (ai == null ? "?" : ai.processName)
@@ -240,9 +248,77 @@ public final class OfxPatch {
         }
     }
 
+    private static volatile int keepFlag = -1;
+    private static volatile String[] blockList;
+
+    /** hardbox-keepalive.txt present: drop activity-finish requests. */
+    public static boolean keepAlive() {
+        int c = keepFlag;
+        if (c >= 0) {
+            return c == 1;
+        }
+        boolean on = flagFile("hardbox-keepalive.txt") != null;
+        keepFlag = on ? 1 : 0;
+        return on;
+    }
+
+    /** hardbox-block.txt: one class-name fragment per line to refuse. */
+    public static boolean blockedClass(String cls) {
+        String[] list = blockList;
+        if (list == null) {
+            java.util.ArrayList<String> acc = new java.util.ArrayList<String>();
+            File f = flagFile("hardbox-block.txt");
+            if (f != null) {
+                try {
+                    BufferedReader r = new BufferedReader(new FileReader(f));
+                    try {
+                        String line;
+                        while ((line = r.readLine()) != null) {
+                            line = line.trim();
+                            if (line.length() > 0) {
+                                acc.add(line);
+                            }
+                        }
+                    } finally {
+                        r.close();
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            list = acc.toArray(new String[0]);
+            blockList = list;
+        }
+        if (cls == null) {
+            return false;
+        }
+        for (String s : list) {
+            if (cls.contains(s)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static File flagFile(String name) {
+        try {
+            File root = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS);
+            File[] c = {
+                    new File(root, name),
+                    new File(new File(root, DIR_NAME), name)
+            };
+            for (File f : c) {
+                if (f != null && f.isFile()) {
+                    return f;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     private static void setField(Class<?> cls, Object target, String name, Object value) {
         Class<?> c = cls;
-        while (c != null) {
             try {
                 java.lang.reflect.Field f = c.getDeclaredField(name);
                 f.setAccessible(true);
