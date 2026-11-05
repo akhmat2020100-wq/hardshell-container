@@ -650,8 +650,8 @@ void dumpDecryptedDex() {
 
     const size_t CHUNK = (size_t)1 << 20;
     const size_t OVER = 16;
-    const size_t SCAN_CAP = (size_t)900 << 20;
-    const size_t REG_CAP = (size_t)384 << 20;
+    const size_t SCAN_CAP = (size_t)2560 << 20;
+    const size_t REG_CAP = (size_t)512 << 20;
 
     unsigned char* buf = (unsigned char*)malloc(CHUNK + OVER);
     if (!buf) { nlogRaw("DUMP", "no scan buffer"); return; }
@@ -723,7 +723,12 @@ void dumpDecryptedDex() {
                             r.score = 3;
                         }
                     } else {
-                        r.score = (pth[0] == 0) ? 3 : 4;
+                        // Bare anon rw-p of dex size is the likeliest home for a
+                        // decrypted InMemoryDexClassLoader payload.
+                        if (pth[0] == 0 && r.len >= (1u << 20) && r.len <= (64u << 20))
+                            r.score = 2;
+                        else
+                            r.score = (pth[0] == 0) ? 3 : 4;
                     }
                     regs.push_back(r);
                 }
@@ -808,6 +813,7 @@ void dumpDecryptedDex() {
             rp += CHUNK;
             scanned += want;
         }
+        if (matchDumps > 0) break;
     }
     free(buf);
 
