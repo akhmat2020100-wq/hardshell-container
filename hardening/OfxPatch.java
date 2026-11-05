@@ -288,6 +288,51 @@ public final class OfxPatch {
         }
     }
 
+    /**
+     * The uid the guest runs under is the host's, so anything that maps
+     * uid -> package (getPackagesForUid, currentPackageName) still answers
+     * with the container. Record every one of those answers once at boot.
+     */
+    public static void envDiag(android.app.Application app) {
+        if (app == null) {
+            return;
+        }
+        try {
+            int uid = android.os.Process.myUid();
+            String[] pkgs = null;
+            try {
+                pkgs = app.getPackageManager().getPackagesForUid(uid);
+            } catch (Throwable ignored) {
+            }
+            String atPkg = null;
+            try {
+                Class<?> at = Class.forName("android.app.ActivityThread");
+                java.lang.reflect.Method m = at.getDeclaredMethod("currentPackageName");
+                m.setAccessible(true);
+                atPkg = (String) m.invoke(null);
+            } catch (Throwable t) {
+                atPkg = "err:" + t.getClass().getSimpleName();
+            }
+            String atOp = null;
+            try {
+                Class<?> at = Class.forName("android.app.ActivityThread");
+                java.lang.reflect.Method m = at.getDeclaredMethod("currentOpPackageName");
+                m.setAccessible(true);
+                atOp = (String) m.invoke(null);
+            } catch (Throwable t) {
+                atOp = "err:" + t.getClass().getSimpleName();
+            }
+            OfxLog.log("env uid=" + uid
+                    + " pkgs=" + (pkgs == null ? "null" : java.util.Arrays.toString(pkgs))
+                    + " atPkg=" + atPkg
+                    + " atOp=" + atOp
+                    + " process=" + app.getProcessName()
+                    + " myPid=" + android.os.Process.myPid());
+        } catch (Throwable t) {
+            OfxLog.log("env failed " + t);
+        }
+    }
+
     private static volatile int keepFlag = -1;
     private static volatile String[] blockList;    /** hardbox-keepalive.txt present: drop activity-finish requests. */
     public static boolean keepAlive() {
