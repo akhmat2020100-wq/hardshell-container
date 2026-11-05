@@ -52,6 +52,24 @@ jobs:
                       "Android.mk src list")
               wr(p, s)
 
+          # ---------- VirtualSpoof: stop lying about the device ----------
+          # __system_property_get is masked with "Pixel 6 / Android 12" while
+          # Build.MODEL / VERSION.SDK_INT stay the real Samsung / API 37. An
+          # integrity check that reads both halves sees an impossible device.
+          p = "src/Bcore/src/main/cpp/Utils/VirtualSpoof.cpp"
+          s = rd(p)
+          if "ofx-spoof-disabled" not in s:
+              s = sub(s,
+                      "__attribute__((constructor)) void init_virtual_spoof()\n"
+                      "{\n"
+                      "    install_property_get_hook();",
+                      "__attribute__((constructor)) void init_virtual_spoof()\n"
+                      "{\n"
+                      "    // ofx-spoof-disabled: Build.* already reports the real device;\n"
+                      "    // a second, fake answer through ro.* is a mismatch signal.\n",
+                      "VirtualSpoof disable")
+              wr(p, s)
+
           # ---------- NativeCore: entry point for the stealth layer ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/NativeCore.java"
           s = rd(p)
@@ -505,6 +523,109 @@ jobs:
                       "            try { top.niunaijun.blackbox.util.OfxPatch.diagNames(mInitialApplication); }\n"
                       "            catch (Throwable ignored) { }",
                       "identity names diag")
+              wr(p, s)
+
+          # ---------- activity_task: block the verdict's second act ----------
+          # Swallowing SIGKILL only removes the executioner. The SDK then asks
+          # the server to finish the Unity activity, which destroys the window.
+          # finishActivity is proxied here, so the request can be dropped while
+          # hardbox-keepalive.txt exists. Every startActivity is logged so the
+          # threat screen's real class name shows up in the log.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/IActivityTaskManagerProxy.java"
+          s = rd(p)
+          if "ofxFinishActivity" not in s:
+              s = sub(s,
+                      "import android.app.ActivityManager;\n\nimport java.lang.reflect.Method;",
+                      "import android.app.ActivityManager;\n"
+                      "import android.content.ComponentName;\n"
+                      "import android.content.Intent;\n"
+                      "\n"
+                      "import java.lang.reflect.Method;",
+                      "IActivityTaskManagerProxy imports")
+              s = sub(s, '    @ProxyMethod("setTaskDescription")',
+                      '    @ProxyMethod("finishActivity")\n'
+                      "    public static class ofxFinishActivity extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            boolean keep = false;\n"
+                      "            try {\n"
+                      "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive();\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      "            if (keep) {\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("finishActivity dropped");\n'
+                      "                return Boolean.FALSE;\n"
+                      "            }\n"
+                      "            return method.invoke(who, args);\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("startActivity")\n'
+                      "    public static class ofxStartActivity extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            try {\n"
+                      "                for (Object a : args) {\n"
+                      "                    if (!(a instanceof Intent)) continue;\n"
+                      "                    Intent i = (Intent) a;\n"
+                      "                    ComponentName cn = i.getComponent();\n"
+                      "                    String cls = cn == null ? \"?\" : cn.getClassName();\n"
+                      "                    String pkg = cn == null ? String.valueOf(i.getPackage()) : cn.getPackageName();\n"
+                      "                    top.niunaijun.blackbox.util.OfxLog.log(\"startActivity \" + pkg + \"/\" + cls\n"
+                      "                            + \" act=\" + i.getAction());\n"
+                      "                    if (cn != null && top.niunaijun.blackbox.util.OfxPatch.blockedClass(cls)) {\n"
+                      '                        top.niunaijun.blackbox.util.OfxLog.log("startActivity blocked " + cls);\n'
+                      "                        return Integer.valueOf(0);\n"
+                      "                    }\n"
+                      "                    break;\n"
+                      "                }\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      "            return method.invoke(who, args);\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("setTaskDescription")',
+                      "IActivityTaskManagerProxy finish/start")
+              wr(p, s)
+
+          # ---------- keepalive + class-block switches, read from Download ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/util/OfxPatch.java"
+          s = rd(p)
+          if "keepAlive()" not in s:
+              s = sub(s, "    private static void setField(Class<?> cls, Object target, String name, Object value) {",
+                      "    /** hardbox-keepalive.txt present: drop finishActivity from the guest. */\n"
+                      "    public static boolean keepAlive() {\n"
+                      "        return flagFile(\"hardbox-keepalive.txt\") != null;\n"
+                      "    }\n"
+                      "\n"
+                      "    /** hardbox-block.txt: one class-name fragment per line to refuse. */\n"
+                      "    public static boolean blockedClass(String cls) {\n"
+                      "        File f = flagFile(\"hardbox-block.txt\");\n"
+                      "        if (f == null || cls == null) return false;\n"
+                      "        try {\n"
+                      "            BufferedReader r = new BufferedReader(new FileReader(f));\n"
+                      "            try {\n"
+                      "                String line;\n"
+                      "                while ((line = r.readLine()) != null) {\n"
+                      "                    line = line.trim();\n"
+                      "                    if (line.length() > 0 && cls.contains(line)) return true;\n"
+                      "                }\n"
+                      "            } finally { r.close(); }\n"
+                      "        } catch (Throwable ignored) { }\n"
+                      "        return false;\n"
+                      "    }\n"
+                      "\n"
+                      "    private static File flagFile(String name) {\n"
+                      "        try {\n"
+                      "            File root = Environment.getExternalStoragePublicDirectory(\n"
+                      "                    Environment.DIRECTORY_DOWNLOADS);\n"
+                      "            File[] c = { new File(root, name), new File(new File(root, DIR_NAME), name) };\n"
+                      "            for (File f : c) { if (f != null && f.isFile()) return f; }\n"
+                      "        } catch (Throwable ignored) { }\n"
+                      "        return null;\n"
+                      "    }\n"
+                      "\n"
+                      "    private static void setField(Class<?> cls, Object target, String name, Object value) {",
+                      "OfxPatch keepalive helpers")
               wr(p, s)
 
           print("patched ok")

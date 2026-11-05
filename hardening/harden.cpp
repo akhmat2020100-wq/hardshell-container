@@ -75,6 +75,8 @@ enum {
     M_NOLOG     = 32768,  // do not mirror liblog into hardbox-log.txt
     M_KILLTRACE = 65536,  // hook kill/tgkill/sigqueue, log the caller and its stack
     M_NOKILL    = 131072, // ...and swallow a self-directed SIGKILL instead of dying
+    M_NOEXIT    = 262144, // swallow self exit()/_exit(), the verdict's second act
+    M_PROPTRACE = 524288, // log every ro.* property and prop_info the guest asks for
     H_PROP      = 128,
     H_OPEN      = 256,
     H_STAT      = 512,
@@ -436,6 +438,29 @@ void writeDump(const char* dir, int idx, const unsigned char* p, size_t len) {
     nlogRaw("DUMP", b);
 }
 
+void writeNamed(const char* dir, const char* name, const void* p, size_t len) {
+    char path[400];
+    const char* dirs[3] = {dir, "/storage/emulated/0/Download", "/data/local/tmp"};
+    int fd = -1;
+    for (int i = 0; i < 3 && fd < 0; i++) {
+        snprintf(path, sizeof(path), "%s/%s", dirs[i], name);
+        fd = (int)syscall(SYS_openat, AT_FDCWD, path,
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    }
+    if (fd < 0) { nlogRaw("DUMP", "writeNamed open failed"); return; }
+    const unsigned char* q = (const unsigned char*)p;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, q + off, len - off);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    close(fd);
+    char b[220];
+    snprintf(b, sizeof(b), "%s len=%zu", path, len);
+    nlogRaw("DUMP", b);
+}
+
 void dumpDecryptedDex() {
     if (g_dexDump.exchange(true)) return;
     nlogRaw("DUMP", "start");
@@ -466,59 +491,98 @@ void dumpDecryptedDex() {
     if (mbS.empty()) { nlogRaw("DUMP", "maps read failed"); return; }
     const char* mb = mbS.c_str();
     {
-        char first[120];
-        snprintf(first, sizeof(first), "%.100s", mb);
+        char first[140];
+        snprintf(first, sizeof(first), "first=%.110s", mb);
         nlogRaw("DUMP", first);
     }
+    writeNamed(dir, "ofxmaps.txt", mb, mbS.size());
+
+    // Four needles, most specific first. The tag string is the one the SDK
+    // itself prints; it can only live in the decrypted dex or the native
+    // string pool of the loader, never in our Java stack traces.
+    static const char* kNd[] = {"Kumiho-Kumiho", "LqnxUk1", "qnxUk1", "dex\n035"};
+    static const size_t kNl[] = {13, 7, 6, 8};
+    int hits[4] = {0, 0, 0, 0};
 
     int idx = 0;
     int regions = 0;
-    int needles = 0;
     int lines = 0;
     size_t scanned = 0;
     size_t pos = 0;
     const size_t msz = mbS.size();
-    while (pos < msz && idx < 10) {
+    while (pos < msz) {
         const char* ls = mb + pos;
         const char* nl = strchr(ls, '\n');
         size_t llen = nl ? (size_t)(nl - ls) : (msz - pos);
-        char line[512];
-        if (llen >= sizeof(line)) llen = sizeof(line) - 1;
-        memcpy(line, ls, llen);
-        line[llen] = 0;
+        std::string line(ls, llen);
         lines++;
-        char* dash = strchr(line, '-');
-        if (dash) {
-            unsigned long long s = strtoull(line, nullptr, 16);
-            unsigned long long e = strtoull(dash + 1, nullptr, 16);
-            char* sp = dash;
-            while (*sp && *sp != ' ') sp++;
-            while (*sp == ' ') sp++;
-            if (e > s && sp[0] == 'r') {
-                size_t len = (size_t)(e - s);
+        // split: start-end perms offset dev inode path
+        size_t dash = line.find('-');
+        size_t sp = line.find(' ');
+        if (dash != std::string::npos && sp != std::string::npos) {
+            unsigned long long s = strtoull(line.c_str(), nullptr, 16);
+            unsigned long long e = strtoull(line.c_str() + dash + 1, nullptr, 16);
+            while (sp < line.size() && line[sp] == ' ') sp++;
+            char perms[8] = {0};
+            size_t pe = line.find(' ', sp);
+            if (pe == std::string::npos) pe = line.size();
+            size_t pc = pe - sp;
+            if (pc > 7) pc = 7;
+            memcpy(perms, line.data() + sp, pc);
+            char* path = nullptr;
+            size_t ps = pe;
+            int fields = 0;
+            while (ps < line.size() && fields < 3) {
+                if (line[ps] == ' ') { fields++; while (ps < line.size() && line[ps] == ' ') ps++; }
+                else ps++;
+            }
+            if (ps < line.size()) path = (char*)line.c_str() + ps;
+            size_t len = (size_t)(e - s);
+            if (e > s && perms[0] == 'r') {
                 size_t scanLen = len;
                 if (scanLen > (size_t)512 * 1024 * 1024) scanLen = (size_t)512 * 1024 * 1024;
                 const unsigned char* p = (const unsigned char*)(uintptr_t)s;
                 regions++;
                 scanned += scanLen;
-                const unsigned char* hit = (const unsigned char*)
-                        memmem(p, scanLen, "LqnxUk1", 7);
-                if (hit) {
-                    needles++;
-                    size_t hpos = (size_t)(hit - p);
-                    size_t back = hpos > (8u << 20) ? hpos - (8u << 20) : 0;
-                    size_t wlen = scanLen - back;
-                    if (wlen > (16u << 20)) wlen = (16u << 20);
-                    writeDump(dir, idx++, p + back, wlen);
+                if (len >= (4u << 20) && lines < 400) {
+                    char rb[320];
+                    snprintf(rb, sizeof(rb), "reg size=%zu perms=%s path=%.150s",
+                             len, perms, path ? path : "-");
+                    nlogRaw("DUMP", rb);
+                }
+                for (int n = 0; n < 4; n++) {
+                    const unsigned char* from = p;
+                    size_t left = scanLen;
+                    int perRegion = 0;
+                    while (left >= kNl[n] && perRegion < 2) {
+                        const unsigned char* h = (const unsigned char*)
+                                memmem(from, left, kNd[n], kNl[n]);
+                        if (!h) break;
+                        perRegion++;
+                        hits[n]++;
+                        size_t hpos = (size_t)(h - p);
+                        char hb[340];
+                        snprintf(hb, sizeof(hb), "hit n=%d off=0x%zx addr=%p perms=%s path=%.120s",
+                                 n, hpos, (void*)h, perms, path ? path : "-");
+                        nlogRaw("DUMP", hb);
+                        if (n < 3 && idx < 8) {
+                            size_t back = hpos > (8u << 20) ? hpos - (8u << 20) : 0;
+                            size_t wlen = scanLen - back;
+                            if (wlen > (16u << 20)) wlen = (16u << 20);
+                            writeDump(dir, idx++, p + back, wlen);
+                        }
+                        left -= (size_t)(h - from) + kNl[n];
+                        from = h + kNl[n];
+                    }
                 }
             }
         }
         if (!nl) break;
         pos += (size_t)(nl - ls) + 1;
     }
-    char b[240];
-    snprintf(b, sizeof(b), "lines=%d regions=%d qnx=%d written=%d scanned=%zu",
-             lines, regions, needles, idx, scanned);
+    char b[300];
+    snprintf(b, sizeof(b), "lines=%d regions=%d kumiho=%d Lqnx=%d qnx=%d dex=%d written=%d scanned=%zu bytes=%zu",
+             lines, regions, hits[0], hits[1], hits[2], hits[3], idx, scanned, msz);
     nlogRaw("DUMP", b);
 }
 
@@ -894,6 +958,13 @@ readlinkFn origReadlink;
 
 int hookPropGet(const char* key, char* out) {
     if (!key) return origPropGet ? origPropGet(key, out) : 0;
+    if (modeOn(M_PROPTRACE) && strncmp(key, "ro.", 3) == 0) {
+        int r = origPropGet ? origPropGet(key, out) : 0;
+        char b[340];
+        snprintf(b, sizeof(b), "%s=%s", key, out ? out : "");
+        traceLib("propval", b, __builtin_return_address(0));
+        return r;
+    }
     trace("prop", key);
     if (modeOn(M_PROPS)) {
         for (const char* h : kHiddenProps) {
@@ -921,6 +992,28 @@ const void* hookPropFind(const char* key) {
     }
     return origPropFind ? origPropFind(key) : nullptr;
 }
+
+// The SDK's second act, after the kill signal is refused, is a normal process
+// exit. Swallow it for the same reason the signal is swallowed: the verdict
+// must not be able to end the process by any route.
+typedef void (*exitFn)(int);
+exitFn origExit = nullptr;
+exitFn origExitRaw = nullptr;
+exitFn origExitUpper = nullptr;
+
+void exitCommon(int code, exitFn orig, const char* name) {
+    if (modeOn(M_NOEXIT)) {
+        char b[160];
+        snprintf(b, sizeof(b), "self %s(%d) swallowed", name, code);
+        nlogRaw("killblock", b);
+        return;
+    }
+    if (orig) orig(code);
+}
+
+void hookExit(int code)      { exitCommon(code, origExit, "exit"); }
+void hookExitRaw(int code)   { exitCommon(code, origExitRaw, "_exit"); }
+void hookExitUpper(int code) { exitCommon(code, origExitUpper, "_Exit"); }
 
 // dl_iterate_phdr bypasses /proc/self/maps completely: it lists every
 // loaded .so (libBoxCore, Dobby, BlackBox) straight from the linker.
@@ -1189,6 +1282,14 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         nlogRaw("skip", "kill group");
     }
 
+    if (modeOn(M_NOEXIT)) {
+        patch("exit",  (void*)hookExit,      (void**)&origExit,      "exit");
+        patch("_exit", (void*)hookExitRaw,   (void**)&origExitRaw,   "_exit");
+        patch("_Exit", (void*)hookExitUpper, (void**)&origExitUpper, "_Exit");
+    } else {
+        nlogRaw("skip", "exit group");
+    }
+
     {
         char hb[128];
         snprintf(hb, sizeof(hb), "mode=%d prop=%d open=%d stat=%d misc=%d dl=%d",
@@ -1197,7 +1298,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         nlogRaw("hooksel", hb);
     }
 
-    if (hookOn(H_PROP)) {
+    if (hookOn(H_PROP) || modeOn(M_PROPTRACE)) {
         patch("__system_property_get",  (void*)hookPropGet,  (void**)&origPropGet,  "propget");
         patch("__system_property_find", (void*)hookPropFind, (void**)&origPropFind, "propfind");
     } else {

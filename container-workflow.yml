@@ -1,0 +1,664 @@
+name: build-container
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream (BlackBox fork, modern NDK/AGP)
+        run: |
+          git clone --depth 1 https://github.com/JDKaintscared/BlackBox.git src
+          cd src && git log -1 --oneline
+
+      - name: Apply instrumentation + stealth
+        run: |
+          cp hardening/OfxLog.java src/Bcore/src/main/java/top/niunaijun/blackbox/util/OfxLog.java
+          cp hardening/OfxPatch.java src/Bcore/src/main/java/top/niunaijun/blackbox/util/OfxPatch.java
+          cp hardening/harden.cpp src/Bcore/src/main/cpp/harden.cpp
+          python3 - <<'PY'
+          import sys, pathlib
+
+          def rd(p):
+              return pathlib.Path(p).read_text()
+
+          def wr(p, s):
+              pathlib.Path(p).write_text(s)
+
+          def sub(s, old, new, tag):
+              if old not in s:
+                  sys.exit("anchor not found: " + tag)
+              return s.replace(old, new, 1)
+
+          # ---------- release build: debuggable=false, no R8 surprises ----------
+          p = "src/app/build.gradle"
+          s = rd(p)
+          if "minifyEnabled false" not in s:
+              s = sub(s, "            minifyEnabled true", "            minifyEnabled false",
+                      "app build.gradle minify")
+              wr(p, s)
+
+          # ---------- native lib: add harden.cpp to the build ----------
+          p = "src/Bcore/src/main/cpp/Android.mk"
+          s = rd(p)
+          if "harden.cpp" not in s:
+              s = sub(s, "LOCAL_SRC_FILES := BoxCore.cpp \\\nhidden_api.cpp",
+                      "LOCAL_SRC_FILES := BoxCore.cpp \\\nharden.cpp \\\nhidden_api.cpp",
+                      "Android.mk src list")
+              wr(p, s)
+
+          # ---------- VirtualSpoof: stop lying about the device ----------
+          # __system_property_get is masked with "Pixel 6 / Android 12" while
+          # Build.MODEL / VERSION.SDK_INT stay the real Samsung / API 37. An
+          # integrity check that reads both halves sees an impossible device.
+          p = "src/Bcore/src/main/cpp/Utils/VirtualSpoof.cpp"
+          s = rd(p)
+          if "ofx-spoof-disabled" not in s:
+              s = sub(s,
+                      "__attribute__((constructor)) void init_virtual_spoof()\n"
+                      "{\n"
+                      "    install_property_get_hook();",
+                      "__attribute__((constructor)) void init_virtual_spoof()\n"
+                      "{\n"
+                      "    // ofx-spoof-disabled: Build.* already reports the real device;\n"
+                      "    // a second, fake answer through ro.* is a mismatch signal.\n",
+                      "VirtualSpoof disable")
+              wr(p, s)
+
+          # ---------- NativeCore: entry point for the stealth layer ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/NativeCore.java"
+          s = rd(p)
+          if "ofxSetGuestPackage" not in s:
+              s = sub(s, "    public static native boolean disableResourceLoading();",
+                      "    public static native boolean disableResourceLoading();\n"
+                      "\n"
+                      "    public static native void ofxSetGuestPackage(String pkg, int logFd, int mode, int uid);\n"
+                      "\n"
+                      "    public static native String ofxDrainTrace();\n"
+                      "    public static native void ofxWriteLog(String line);",
+                      "NativeCore native decl")
+              wr(p, s)
+
+          # ---------- guest boot: hand the package name to native, install hooks ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "ofxSetGuestPackage" not in s:
+              s = sub(s, "            this.mAppConfig = appConfig;",
+                      "            this.mAppConfig = appConfig;\n"
+                      "            try {\n"
+                      "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName,\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.mode(),\n"
+                      "                        android.os.Process.myUid());\n"
+                      "            } catch (Throwable ignored) {\n"
+                      "            }",
+                      "initProcess stealth hook")
+              wr(p, s)
+
+          # ---------- Bcore logger ----------
+          # (copied above)
+
+          # ---------- LauncherActivity: launch chain ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/LauncherActivity.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
+                      "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "LauncherActivity import")
+              s = sub(s, 'Slog.d(TAG, "App launch initiated successfully");',
+                      'Slog.d(TAG, "App launch initiated successfully");\n'
+                      '                OfxLog.log("launchAppAsync startActivity returned");',
+                      "LaunchActivity ok")
+              s = sub(s, 'Slog.e(TAG, "Error launching app", e);',
+                      'Slog.e(TAG, "Error launching app", e);\n'
+                      '                OfxLog.log("LAUNCH FAILED " + e);\n'
+                      '                OfxLog.log(android.util.Log.getStackTraceString(e));',
+                      "LaunchActivity catch")
+              wr(p, s)
+
+          # ---------- ActivityStack: guest process creation ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/am/ActivityStack.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
+                      "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "ActivityStack import")
+              s = sub(s, "ProcessRecord targetApp = BProcessManagerService.get().startProcessLocked(info.packageName, info.processName, userId, -1, Binder.getCallingPid());",
+                      'OfxLog.log("startActivityProcess pkg=" + info.packageName + " proc=" + info.processName);\n'
+                      "        ProcessRecord targetApp = BProcessManagerService.get().startProcessLocked(info.packageName, info.processName, userId, -1, Binder.getCallingPid());\n"
+                      '        OfxLog.log("startActivityProcess -> " + (targetApp != null));',
+                      "ActivityStack startActivityProcess")
+              wr(p, s)
+
+          # ---------- BProcessManagerService: spawn + provider handshake ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/BProcessManagerService.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
+                      "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "BProcessManager import")
+              s = sub(s, "        ApplicationInfo info = BPackageManagerService.get().getApplicationInfo(packageName, 0, userId);",
+                      '        OfxLog.log("startProcessLocked pkg=" + packageName + " proc=" + processName + " user=" + userId);\n'
+                      "        ApplicationInfo info = BPackageManagerService.get().getApplicationInfo(packageName, 0, userId);",
+                      "startProcessLocked entry")
+              s = sub(s, "            if (!initAppProcessL(app)) {",
+                      "            boolean inited;\n"
+                      "            try {\n"
+                      "                inited = initAppProcessL(app);\n"
+                      "            } catch (Throwable t) {\n"
+                      '                OfxLog.log("initAppProcessL threw " + t);\n'
+                      "                OfxLog.log(android.util.Log.getStackTraceString(t));\n"
+                      "                inited = false;\n"
+                      "            }\n"
+                      '            OfxLog.log("initAppProcessL -> " + inited);\n'
+                      "            if (!inited) {",
+                      "initAppProcessL guard")
+              s = sub(s, '        Bundle init = ProviderCall.callSafely(record.getProviderAuthority(), "_Black_|_init_process_", null, bundle);',
+                      '        OfxLog.log("provider call " + record.getProviderAuthority());\n'
+                      '        Bundle init = ProviderCall.callSafely(record.getProviderAuthority(), "_Black_|_init_process_", null, bundle);\n'
+                      '        OfxLog.log("provider call -> " + (init != null));',
+                      "provider call")
+              wr(p, s)
+
+          # ---------- ProxyContentProvider: proof the guest process exists ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/proxy/ProxyContentProvider.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "    public boolean onCreate() {",
+                      '    public boolean onCreate() {\n'
+                      '        top.niunaijun.blackbox.util.OfxLog.log("guest provider onCreate");',
+                      "provider onCreate")
+              s = sub(s, "    public Bundle call(@NonNull String method, @Nullable String arg, @Nullable Bundle extras) {",
+                      "    public Bundle call(@NonNull String method, @Nullable String arg, @Nullable Bundle extras) {\n"
+                      '        top.niunaijun.blackbox.util.OfxLog.log("guest provider call " + method);',
+                      "provider call")
+              wr(p, s)
+
+          # ---------- BActivityThread: guest-side boot ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "import top.niunaijun.blackbox.util.OfxLog;" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.utils.Slog;",
+                      "import top.niunaijun.blackbox.utils.Slog;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "BActivityThread import")
+              s = sub(s, "    public void bindApplication(final String packageName, final String processName) {",
+                      "    public void bindApplication(final String packageName, final String processName) {\n"
+                      '        OfxLog.log("bindApplication " + packageName + "/" + processName);',
+                      "bindApplication")
+              wr(p, s)
+
+          # ---------- BActivityThread: how far guest boot actually got ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "makeApplication begin" not in s:
+              s = sub(s, "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);",
+                      '                OfxLog.log("makeApplication begin " + packageName);\n'
+                      "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);\n"
+                      '                OfxLog.log("makeApplication done " + (application != null));\n'
+                      "                try {\n"
+                      "                    android.content.pm.ApplicationInfo ai2 = (application == null) ? null : application.getApplicationInfo();\n"
+                      "                    OfxLog.log(\"id \" + (ai2 == null ? \"null\" : (\"src=\" + ai2.sourceDir + \" data=\" + ai2.dataDir + \" lib=\" + ai2.nativeLibraryDir + \" uid=\" + ai2.uid + \" myuid=\" + android.os.Process.myUid() + \" pkg=\" + ai2.packageName)));\n"
+                      "                } catch (Throwable t2) {\n"
+                      '                    OfxLog.log("id failed " + t2);\n'
+                      "                }",
+                      "makeApplication log")
+              s = sub(s, "            onBeforeApplicationOnCreate(packageName, processName, application);",
+                      '            OfxLog.log("Application.onCreate begin " + application.getClass().getName());\n'
+                      "            onBeforeApplicationOnCreate(packageName, processName, application);",
+                      "onCreate begin")
+              s = sub(s, "            onAfterApplicationOnCreate(packageName, processName, application);",
+                      "            onAfterApplicationOnCreate(packageName, processName, application);\n"
+                      '            OfxLog.log("Application.onCreate done");',
+                      "onCreate done")
+              s = sub(s, '            Slog.e(TAG, "Critical error in handleBindApplication", e);',
+                      '            Slog.e(TAG, "Critical error in handleBindApplication", e);\n'
+                      '            OfxLog.log("BIND FAILED " + e);\n'
+                      "            OfxLog.log(android.util.Log.getStackTraceString(e));",
+                      "bind catch")
+              wr(p, s)
+
+          # ---------- BActivityThread: step markers inside handleBindApplication ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "hBind start" not in s:
+              s = sub(s, "    public synchronized void handleBindApplication(String packageName, String processName) {",
+                      "    public synchronized void handleBindApplication(String packageName, String processName) {\n"
+                      '        OfxLog.log("hBind start " + packageName);',
+                      "hBind start")
+              s = sub(s, "        Object boundApplication = BRActivityThread.get(BlackBoxCore.mainThread()).mBoundApplication();",
+                      '        OfxLog.log("hBind packageInfo done");\n'
+                      "        Object boundApplication = BRActivityThread.get(BlackBoxCore.mainThread()).mBoundApplication();\n"
+                      '        OfxLog.log("hBind boundApplication done");',
+                      "hBind packageInfo")
+              s = sub(s, "        Context packageContext = createPackageContext(applicationInfo);",
+                      '        OfxLog.log("hBind createPackageContext begin");\n'
+                      "        Context packageContext = createPackageContext(applicationInfo);\n"
+                      "        top.niunaijun.blackbox.util.OfxLog.install(packageContext);\n"
+                      "        try {\n"
+                      "            OfxLog.log(\"guest env data=\" + applicationInfo.dataDir\n"
+                      "                    + \" files=\" + packageContext.getFilesDir()\n"
+                      "                    + \" cache=\" + packageContext.getCacheDir()\n"
+                      "                    + \" nulib=\" + applicationInfo.nativeLibraryDir\n"
+                      "                    + \" uid=\" + android.os.Process.myUid()\n"
+                      "                    + \" uidAi=\" + applicationInfo.uid\n"
+                      "                    + \" proc=\" + OfxLog.procName());\n"
+                      "        } catch (Throwable t) {\n"
+                      '            OfxLog.log("guest env failed " + t);\n'
+                      "        }\n"
+                      '        OfxLog.log("hBind createPackageContext done");',
+                      "hBind packageContext")
+              s = sub(s, "            WebView.setDataDirectorySuffix(getUserId() + \":\" + packageName + \":\" + processName);",
+                      "            WebView.setDataDirectorySuffix(getUserId() + \":\" + packageName + \":\" + processName);\n"
+                      '            OfxLog.log("hBind webview done");',
+                      "hBind webview")
+              s = sub(s, "        VirtualRuntime.setupRuntime(processName, applicationInfo);",
+                      '        OfxLog.log("hBind setupRuntime begin");\n'
+                      "        VirtualRuntime.setupRuntime(processName, applicationInfo);\n"
+                      '        OfxLog.log("hBind setupRuntime done");',
+                      "hBind setupRuntime")
+              s = sub(s, "        NativeCore.init(Build.VERSION.SDK_INT);",
+                      '        OfxLog.log("hBind NativeCore.init begin");\n'
+                      "        NativeCore.init(Build.VERSION.SDK_INT);\n"
+                      '        OfxLog.log("hBind NativeCore.init done");',
+                      "hBind nativecore")
+              s = sub(s, "        IOCore.get().enableRedirect(packageContext);",
+                      '        OfxLog.log("hBind enableRedirect begin");\n'
+                      "        IOCore.get().enableRedirect(packageContext);\n"
+                      '        OfxLog.log("hBind enableRedirect done");',
+                      "hBind iocore")
+              wr(p, s)
+
+          # ---------- AppInstrumentation: did the game's Activity even start? ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/delegate/AppInstrumentation.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.utils.HackAppUtils;",
+                      "import top.niunaijun.blackbox.utils.HackAppUtils;\nimport top.niunaijun.blackbox.util.OfxLog;",
+                      "AppInstrumentation import")
+              s = sub(s, '        Log.d(TAG, "callActivityOnCreate: " + activity.getClass().getName());',
+                      '        Log.d(TAG, "callActivityOnCreate: " + activity.getClass().getName());\n'
+                      '        OfxLog.log("Activity.onCreate " + activity.getClass().getName());',
+                      "AppInstrumentation checkActivity")
+              s = sub(s, "    public Activity newActivity(ClassLoader cl, String className, Intent intent) throws InstantiationException, IllegalAccessException, ClassNotFoundException {",
+                      "    public Activity newActivity(ClassLoader cl, String className, Intent intent) throws InstantiationException, IllegalAccessException, ClassNotFoundException {\n"
+                      '        OfxLog.log("newActivity " + className);',
+                      "AppInstrumentation newActivity")
+              wr(p, s)
+
+          # ---------- Application override for the protected guest ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "OfxPatch" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.util.OfxLog;",
+                      "import top.niunaijun.blackbox.util.OfxLog;\nimport top.niunaijun.blackbox.util.OfxPatch;",
+                      "BActivityThread OfxPatch import")
+              s = sub(s,
+                      "        ApplicationInfo applicationInfo = packageInfo.applicationInfo;\n"
+                      "        if (packageInfo.providers == null) {",
+                      "        ApplicationInfo applicationInfo = packageInfo.applicationInfo;\n"
+                      "        applicationInfo = OfxPatch.adjust(applicationInfo, packageName, processName);\n"
+                      "        packageInfo.applicationInfo = applicationInfo;\n"
+                      "        if (packageInfo.providers == null) {",
+                      "appInfo override")
+              s = sub(s,
+                      "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);",
+                      "                application = BRLoadedApk.get(loadedApk).makeApplication(OfxPatch.forceDefault(packageName), null);",
+                      "makeApplication force flag")
+              wr(p, s)
+
+          # ---------- Guest install: size and free space (the target is ~900 MB) ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/pm/installer/CopyExecutor.java"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "    public int exec(BPackageSettings ps, InstallOption option, int userId) {\n        try {",
+                      "    public int exec(BPackageSettings ps, InstallOption option, int userId) {\n"
+                      "        long t0 = android.os.SystemClock.elapsedRealtime();\n"
+                      '        top.niunaijun.blackbox.util.OfxLog.log("install start " + ps.pkg.packageName\n'
+                      "                + \" apk=\" + ps.pkg.baseCodePath\n"
+                      "                + \" size=\" + new File(ps.pkg.baseCodePath).length()\n"
+                      "                + \" free=\" + BEnvironment.getDataDir(ps.pkg.packageName, userId).getUsableSpace());\n"
+                      "        try {",
+                      "CopyExecutor start")
+              s = sub(s, "        return 0;\n    }\n}",
+                      "        top.niunaijun.blackbox.util.OfxLog.log(\"install ok \" + ps.pkg.packageName\n"
+                      "                + \" in \" + (android.os.SystemClock.elapsedRealtime() - t0) + \"ms\");\n"
+                      "        return 0;\n    }\n}",
+                      "CopyExecutor done")
+              wr(p, s)
+
+          # ---------- Host app: install logger in every process ----------
+          p = "src/app/src/main/java/top/niunaijun/blackboxa/app/App.kt"
+          s = rd(p)
+          if "OfxLog.install" not in s:
+              s = sub(s, "import top.niunaijun.blackbox.BlackBoxCore",
+                      "import top.niunaijun.blackbox.BlackBoxCore\nimport top.niunaijun.blackbox.util.OfxLog",
+                      "App.kt import")
+              s = sub(s, "            super.attachBaseContext(base)",
+                      "            super.attachBaseContext(base)\n            OfxLog.install(this)",
+                      "App.kt install")
+              wr(p, s)
+
+          p = "src/app/src/main/java/top/niunaijun/blackboxa/view/main/WelcomeActivity.kt"
+          s = rd(p)
+          if "OfxLog" not in s:
+              s = sub(s, "import android.os.Bundle",
+                      "import android.os.Bundle\nimport top.niunaijun.blackbox.util.OfxLog",
+                      "Welcome import")
+              s = sub(s, "        super.onCreate(savedInstanceState)",
+                      '        super.onCreate(savedInstanceState)\n        OfxLog.log("WelcomeActivity.onCreate")',
+                      "Welcome log")
+              wr(p, s)
+
+          # ---------- IServiceConnection: survive the API 36/37 signature ----------
+          # The platform class shadows our AIDL copy, so Stub.onTransact dispatches
+          # connected(ComponentName, IBinder, IBinderSession, boolean) and blows up
+          # with AbstractMethodError on every service binding -> JNI FatalError.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/delegate/ServiceConnectionDelegate.java"
+          s = rd(p)
+          if "onTransact(int code" not in s:
+              s = sub(s,
+                      "    public void connected(ComponentName name, IBinder service, boolean dead) throws RemoteException {",
+                      "    @Override\n"
+                      "    public boolean onTransact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) throws RemoteException {\n"
+                      "        if (code == 1) {\n"
+                      "            try {\n"
+                      "                data.enforceInterface(\"android.app.IServiceConnection\");\n"
+                      "                ComponentName name = data.readInt() != 0\n"
+                      "                        ? ComponentName.CREATOR.createFromParcel(data) : null;\n"
+                      "                IBinder service = data.readStrongBinder();\n"
+                      "                boolean dead = false;\n"
+                      "                if (data.dataAvail() > 0) {\n"
+                      "                    try { data.readStrongBinder(); } catch (Throwable ignored) { }\n"
+                      "                    if (data.dataAvail() > 0) dead = data.readInt() != 0;\n"
+                      "                }\n"
+                      "                connected(name, service, dead);\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      "            return true;\n"
+                      "        }\n"
+                      "        try {\n"
+                      "            return super.onTransact(code, data, reply, flags);\n"
+                      "        } catch (Throwable ignored) {\n"
+                      "            return true;\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      "    public void connected(ComponentName name, IBinder service, boolean dead) throws RemoteException {",
+                      "ServiceConnectionDelegate onTransact")
+              wr(p, s)
+
+          # ---------- diagnostics: what identity does the guest actually see ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "APP pkg=" not in s:
+              s = sub(s, "            ContextCompat.fix(mInitialApplication);",
+                      "            ContextCompat.fix(mInitialApplication);\n"
+                      "            try {\n"
+                      '                OfxLog.log("v9 APP pkg=" + mInitialApplication.getPackageName()\n'
+                      '                        + " op=" + mInitialApplication.getOpPackageName()\n'
+                      '                        + " aipkg=" + mInitialApplication.getApplicationInfo().packageName\n'
+                      '                        + " dataDir=" + mInitialApplication.getApplicationInfo().dataDir\n'
+                      '                        + " files=" + mInitialApplication.getFilesDir()\n'
+                      '                        + " basepkg=" + (mInitialApplication.getBaseContext() == null\n'
+                      '                                ? "null" : mInitialApplication.getBaseContext().getPackageName()));\n'
+                      "            } catch (Throwable t) {\n"
+                      '                OfxLog.log("v9 APP diag failed " + t);\n'
+                      "            }",
+                      "APP identity diag")
+              wr(p, s)
+
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/system/pm/BPackageManagerService.java"
+          s = rd(p)
+          if "getPackagesForUid uid=" not in s:
+              s = sub(s,
+                      "    public String[] getPackagesForUid(int uid, int userId) throws RemoteException {\n"
+                      "        if (!sUserManager.exists(userId)) return new String[]{};",
+                      "    public String[] getPackagesForUid(int uid, int userId) throws RemoteException {\n"
+                      "        if (!sUserManager.exists(userId)) return new String[]{};\n"
+                      "        if (uid == android.os.Process.myUid())\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("getPackagesForUid uid=" + uid + " user=" + userId);',
+                      "getPackagesForUid diag")
+              s = sub(s, "            return packages.toArray(new String[]{});",
+                      "            String[] outArr = packages.toArray(new String[]{});\n"
+                      "            if (uid == android.os.Process.myUid())\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("getPackagesForUid -> " + java.util.Arrays.toString(outArr));\n'
+                      "            return outArr;",
+                      "getPackagesForUid result diag")
+              wr(p, s)
+
+          # ---------- identity: stop handing the host package to SDKs ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/utils/compat/ContextCompat.java"
+          s = rd(p)
+          if "ofxIdentityPkg" not in s:
+              s = sub(s, "public class ContextCompat {\n    public static final String TAG = \"ContextCompat\";",
+                      "public class ContextCompat {\n"
+                      "    public static final String TAG = \"ContextCompat\";\n"
+                      "    // set by fix(); null = keep the legacy host-package behaviour\n"
+                      "    public static String ofxIdentityPkg = null;",
+                      "ContextCompat identity field")
+              s = sub(s, "            AttributionSourceStateContext attributionSourceStateContext = BRAttributionSourceState.get(mAttributionSourceState);\n"
+                         "            attributionSourceStateContext._set_packageName(BlackBoxCore.getHostPkg());",
+                      "            AttributionSourceStateContext attributionSourceStateContext = BRAttributionSourceState.get(mAttributionSourceState);\n"
+                      "            attributionSourceStateContext._set_packageName(ofxIdentityPkg != null\n"
+                      "                    ? ofxIdentityPkg : BlackBoxCore.getHostPkg());",
+                      "ContextCompat attribution pkg")
+              s = sub(s, "            BRContextImpl.get(context)._set_mBasePackageName(BlackBoxCore.getHostPkg());\n"
+                         "            BRContextImplKitkat.get(context)._set_mOpPackageName(BlackBoxCore.getHostPkg());",
+                      "            String ofxId = top.niunaijun.blackbox.util.OfxLog.identityHost()\n"
+                      "                    ? BlackBoxCore.getHostPkg() : context.getPackageName();\n"
+                      "            ofxIdentityPkg = ofxId;\n"
+                      "            BRContextImpl.get(context)._set_mBasePackageName(ofxId);\n"
+                      "            BRContextImplKitkat.get(context)._set_mOpPackageName(ofxId);",
+                      "ContextCompat base/op pkg")
+              s = sub(s, "                BRContentResolver.get(context.getContentResolver())._set_mPackageName(BlackBoxCore.getHostPkg());",
+                      "                BRContentResolver.get(context.getContentResolver())._set_mPackageName(ofxId);",
+                      "ContextCompat resolver pkg")
+              wr(p, s)
+
+          # ---------- getNameForUid: the last place the host package leaks ----------
+          # getPackagesForUid is proxied, getNameForUid is not - so it lands on the
+          # real PackageManager and answers "top.niunaijun.blackbox" for our own uid.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/IPackageManagerProxy.java"
+          s = rd(p)
+          if "getNameForUid" not in s:
+              s = sub(s, "        addMethodHook(new XiaomiSecurityBypass());",
+                      "        addMethodHook(new XiaomiSecurityBypass());\n"
+                      "        addMethodHook(new GetNameForUid());\n"
+                      "        addMethodHook(new GetNamesForUids());",
+                      "IPackageManagerProxy register")
+              s = sub(s, '    @ProxyMethod("getInstallerPackageName")',
+                      '    @ProxyMethod("getNameForUid")\n'
+                      "    public static class GetNameForUid extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            int uid = MethodParameterUtils.toInt(args[0]);\n"
+                      "            String guest = BActivityThread.getAppPackageName();\n"
+                      "            try {\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("getNameForUid uid=" + uid\n'
+                      '                        + " self=" + android.os.Process.myUid()\n'
+                      '                        + " host=" + BlackBoxCore.getHostUid()\n'
+                      '                        + " guest=" + guest);\n'
+                      "            } catch (Throwable ignored) { }\n"
+                      "            if (guest != null && (uid == android.os.Process.myUid()\n"
+                      "                    || uid == BlackBoxCore.getHostUid())) {\n"
+                      "                return guest;\n"
+                      "            }\n"
+                      "            return method.invoke(who, args);\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("getNamesForUids")\n'
+                      "    public static class GetNamesForUids extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            String guest = BActivityThread.getAppPackageName();\n"
+                      "            int[] uids = (args != null && args.length > 0 && args[0] instanceof int[])\n"
+                      "                    ? (int[]) args[0] : null;\n"
+                      "            if (guest == null || uids == null) return method.invoke(who, args);\n"
+                      "            String[] out = new String[uids.length];\n"
+                      "            for (int i = 0; i < uids.length; i++) {\n"
+                      "                if (uids[i] == android.os.Process.myUid()\n"
+                      "                        || uids[i] == BlackBoxCore.getHostUid()) {\n"
+                      "                    out[i] = guest;\n"
+                      "                }\n"
+                      "            }\n"
+                      "            return out;\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("getInstallerPackageName")',
+                      "IPackageManagerProxy name-for-uid")
+              wr(p, s)
+
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
+          s = rd(p)
+          if "OfxPatch.diagNames" not in s:
+              s = sub(s, '                OfxLog.log("v9 APP diag failed " + t);\n            }',
+                      '                OfxLog.log("v9 APP diag failed " + t);\n'
+                      "            }\n"
+                      "            try { top.niunaijun.blackbox.util.OfxPatch.diagNames(mInitialApplication); }\n"
+                      "            catch (Throwable ignored) { }",
+                      "identity names diag")
+              wr(p, s)
+
+          # ---------- activity_task: block the verdict's second act ----------
+          # Swallowing SIGKILL only removes the executioner. The SDK then asks
+          # the server to finish the Unity activity, which destroys the window.
+          # finishActivity is proxied here, so the request can be dropped while
+          # hardbox-keepalive.txt exists. Every startActivity is logged so the
+          # threat screen's real class name shows up in the log.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/IActivityTaskManagerProxy.java"
+          s = rd(p)
+          if "ofxFinishActivity" not in s:
+              s = sub(s,
+                      "import android.app.ActivityManager;\n\nimport java.lang.reflect.Method;",
+                      "import android.app.ActivityManager;\n"
+                      "import android.content.ComponentName;\n"
+                      "import android.content.Intent;\n"
+                      "\n"
+                      "import java.lang.reflect.Method;",
+                      "IActivityTaskManagerProxy imports")
+              s = sub(s, '    @ProxyMethod("setTaskDescription")',
+                      '    @ProxyMethod("finishActivity")\n'
+                      "    public static class ofxFinishActivity extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            boolean keep = false;\n"
+                      "            try {\n"
+                      "                keep = top.niunaijun.blackbox.util.OfxPatch.keepAlive();\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      "            if (keep) {\n"
+                      '                top.niunaijun.blackbox.util.OfxLog.log("finishActivity dropped");\n'
+                      "                return Boolean.FALSE;\n"
+                      "            }\n"
+                      "            return method.invoke(who, args);\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("startActivity")\n'
+                      "    public static class ofxStartActivity extends MethodHook {\n"
+                      "        @Override\n"
+                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
+                      "            try {\n"
+                      "                for (Object a : args) {\n"
+                      "                    if (!(a instanceof Intent)) continue;\n"
+                      "                    Intent i = (Intent) a;\n"
+                      "                    ComponentName cn = i.getComponent();\n"
+                      "                    String cls = cn == null ? \"?\" : cn.getClassName();\n"
+                      "                    String pkg = cn == null ? String.valueOf(i.getPackage()) : cn.getPackageName();\n"
+                      "                    top.niunaijun.blackbox.util.OfxLog.log(\"startActivity \" + pkg + \"/\" + cls\n"
+                      "                            + \" act=\" + i.getAction());\n"
+                      "                    if (cn != null && top.niunaijun.blackbox.util.OfxPatch.blockedClass(cls)) {\n"
+                      '                        top.niunaijun.blackbox.util.OfxLog.log("startActivity blocked " + cls);\n'
+                      "                        return Integer.valueOf(0);\n"
+                      "                    }\n"
+                      "                    break;\n"
+                      "                }\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      "            return method.invoke(who, args);\n"
+                      "        }\n"
+                      "    }\n"
+                      "\n"
+                      '    @ProxyMethod("setTaskDescription")',
+                      "IActivityTaskManagerProxy finish/start")
+              wr(p, s)
+
+          # ---------- keepalive + class-block switches, read from Download ----------
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/util/OfxPatch.java"
+          s = rd(p)
+          if "keepAlive()" not in s:
+              s = sub(s, "    private static void setField(Class<?> cls, Object target, String name, Object value) {",
+                      "    /** hardbox-keepalive.txt present: drop finishActivity from the guest. */\n"
+                      "    public static boolean keepAlive() {\n"
+                      "        return flagFile(\"hardbox-keepalive.txt\") != null;\n"
+                      "    }\n"
+                      "\n"
+                      "    /** hardbox-block.txt: one class-name fragment per line to refuse. */\n"
+                      "    public static boolean blockedClass(String cls) {\n"
+                      "        File f = flagFile(\"hardbox-block.txt\");\n"
+                      "        if (f == null || cls == null) return false;\n"
+                      "        try {\n"
+                      "            BufferedReader r = new BufferedReader(new FileReader(f));\n"
+                      "            try {\n"
+                      "                String line;\n"
+                      "                while ((line = r.readLine()) != null) {\n"
+                      "                    line = line.trim();\n"
+                      "                    if (line.length() > 0 && cls.contains(line)) return true;\n"
+                      "                }\n"
+                      "            } finally { r.close(); }\n"
+                      "        } catch (Throwable ignored) { }\n"
+                      "        return false;\n"
+                      "    }\n"
+                      "\n"
+                      "    private static File flagFile(String name) {\n"
+                      "        try {\n"
+                      "            File root = Environment.getExternalStoragePublicDirectory(\n"
+                      "                    Environment.DIRECTORY_DOWNLOADS);\n"
+                      "            File[] c = { new File(root, name), new File(new File(root, DIR_NAME), name) };\n"
+                      "            for (File f : c) { if (f != null && f.isFile()) return f; }\n"
+                      "        } catch (Throwable ignored) { }\n"
+                      "        return null;\n"
+                      "    }\n"
+                      "\n"
+                      "    private static void setField(Class<?> cls, Object target, String name, Object value) {",
+                      "OfxPatch keepalive helpers")
+              wr(p, s)
+
+          print("patched ok")
+          PY
+          grep -c "ofxSetGuestPackage" \
+            src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java \
+            src/Bcore/src/main/java/top/niunaijun/blackbox/core/NativeCore.java
+          grep -c "harden.cpp" src/Bcore/src/main/cpp/Android.mk
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Android SDK components
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SM" ] || SM="sdkmanager"
+          yes | "$SM" --licenses > /dev/null || true
+          yes | "$SM" --install "ndk;29.0.13846066" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0" > /dev/null || true
+          echo "sdk.dir=$SDK" >> src/local.properties
+          echo "ndk.dir=$SDK/ndk/29.0.13846066" >> src/local.properties
+
+      - name: Build
+        working-directory: src
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackbox-apk
+          path: src/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
