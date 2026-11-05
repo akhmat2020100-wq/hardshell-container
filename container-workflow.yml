@@ -198,6 +198,7 @@ jobs:
           if "makeApplication begin" not in s:
               s = sub(s, "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);",
                       '                OfxLog.log("makeApplication begin " + packageName);\n'
+                      "                try { top.niunaijun.blackbox.util.OfxPatch.preBindApplication(packageContext); } catch (Throwable t0) { OfxLog.log(\"preBind outer \" + t0); }\n"
                       "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);\n"
                       '                OfxLog.log("makeApplication done " + (application != null));\n'
                       "                try {\n"

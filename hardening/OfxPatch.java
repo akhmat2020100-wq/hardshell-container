@@ -289,6 +289,39 @@ public final class OfxPatch {
     }
 
     /**
+     * AppDome's native library lands while LoadedApk#makeApplication is still
+     * running the guest Application's constructor. At that instant the real
+     * ActivityThread.mInitialApplication is still BlackBox's own Application,
+     * so any native code that caches currentApplication() captures the host
+     * package ("top.niunaijun.blackbox") and reads it back later as
+     * "virtualized environment". Park a guest-backed placeholder in that field
+     * before the constructor runs; the real Application replaces it a few
+     * milliseconds later in BActivityThread.
+     */
+    public static final class TmpApp extends android.app.Application {
+        void bind(android.content.Context base) {
+            attachBaseContext(base);
+        }
+    }
+
+    public static void preBindApplication(android.content.Context base) {
+        if (base == null) {
+            return;
+        }
+        try {
+            TmpApp tmp = new TmpApp();
+            tmp.bind(base);
+            black.android.app.BRActivityThread.get(
+                    top.niunaijun.blackbox.BlackBoxCore.mainThread())
+                    ._set_mInitialApplication(tmp);
+            OfxLog.log("preBind tmp=" + tmp.getPackageName()
+                    + " base=" + base.getPackageName());
+        } catch (Throwable t) {
+            OfxLog.log("preBind failed " + t);
+        }
+    }
+
+    /**
      * The uid the guest runs under is the host's, so anything that maps
      * uid -> package (getPackagesForUid, currentPackageName) still answers
      * with the container. Record every one of those answers once at boot.
