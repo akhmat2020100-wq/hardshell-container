@@ -510,28 +510,6 @@ jobs:
                       "        }\n"
                       "    }\n"
                       "\n"
-                      '    @ProxyMethod("getPackagesForUid")\n'
-                      "    public static class GetPackagesForUid extends MethodHook {\n"
-                      "        @Override\n"
-                      "        protected Object hook(Object who, Method method, Object[] args) throws Throwable {\n"
-                      "            String guest = BActivityThread.getAppPackageName();\n"
-                      "            int uid = MethodParameterUtils.toInt(args[0]);\n"
-                      "            Object res = method.invoke(who, args);\n"
-                      "            try {\n"
-                      '                top.niunaijun.blackbox.util.OfxLog.log("getPackagesForUid uid=" + uid\n'
-                      '                        + " self=" + android.os.Process.myUid()\n'
-                      '                        + " host=" + BlackBoxCore.getHostUid()\n'
-                      '                        + " guest=" + guest\n'
-                      '                        + " orig=" + java.util.Arrays.toString((String[]) res));\n'
-                      "            } catch (Throwable ignored) { }\n"
-                      "            if (guest != null && (uid == android.os.Process.myUid()\n"
-                      "                    || uid == BlackBoxCore.getHostUid())) {\n"
-                      "                return new String[]{guest};\n"
-                      "            }\n"
-                      "            return res;\n"
-                      "        }\n"
-                      "    }\n"
-                      "\n"
                       '    @ProxyMethod("getInstallerPackageName")',
                       "IPackageManagerProxy name-for-uid")
               wr(p, s)
