@@ -1609,6 +1609,109 @@ static jint JNICALL hookRegNatives(JNIEnv* env, jclass cls,
     return rc;
 }
 
+// ---------------------------------------------------------------------------
+// Host-package string rewrite at the JNI boundary.
+//
+// Kumiho logs `getPackageName: top.niunaijun.blackbox` from native code while
+// the Java thread sits inside Unity's BitmapFactory call - so the read is a
+// JNI call made by AppDome's own library, not a Java-side getPackageName().
+// BlackBox already makes every Java surface answer with the guest package, so
+// the only way that host string reaches native is the return value of an
+// object-returning JNI call. Rewrite exactly that value: if a call hands back
+// a java.lang.String equal to the host package, hand back the guest package
+// instead. Nothing else is touched - every other return keeps its identity.
+//
+// Slots used (ABI-fixed JNINativeInterface order, same table as RegisterNatives):
+//   35  CallObjectMethodV        36  CallObjectMethodA
+//   65  CallNonvirtualObjectMethodV  66  CallNonvirtualObjectMethodA
+//   115 CallStaticObjectMethodV  116 CallStaticObjectMethodA
+// The variadic CallObjectMethod(...) entry packs into a va_list and forwards to
+// slot 35 inside libart, so this covers it too.
+// ---------------------------------------------------------------------------
+typedef jobject (*callObjVFn)(JNIEnv*, jobject, jmethodID, va_list);
+typedef jobject (*callObjAFn)(JNIEnv*, jobject, jmethodID, const jvalue*);
+typedef jobject (*callStObjVFn)(JNIEnv*, jclass, jmethodID, va_list);
+typedef jobject (*callStObjAFn)(JNIEnv*, jclass, jmethodID, const jvalue*);
+
+static callObjVFn   g_origObjV   = nullptr;
+static callObjAFn   g_origObjA   = nullptr;
+static callObjVFn   g_origNvObjV = nullptr;
+static callObjAFn   g_origNvObjA = nullptr;
+static callStObjVFn g_origStObjV = nullptr;
+static callStObjAFn g_origStObjA = nullptr;
+static jclass       g_strCls     = nullptr;
+static std::atomic<int> g_strHits{0};
+static std::atomic<int> g_strCalls{0};
+
+// Called with a fully-formed return value. Cheap rejects first: null and any
+// non-string object leave immediately, so ordinary JNI traffic pays two loads
+// and one vtable call, not a UTF conversion.
+static inline jstring rewriteHostString(JNIEnv* env, jobject res) {
+    if (!res || !g_strCls) return (jstring) res;
+    if (g_strCalls.fetch_add(1, std::memory_order_relaxed) >= 2000000) return (jstring) res;
+    if (!env->IsInstanceOf(res, g_strCls)) return (jstring) res;
+    const char* c = env->GetStringUTFChars((jstring) res, nullptr);
+    if (!c) { env->ExceptionClear(); return (jstring) res; }
+    bool host = (strcmp(c, "top.niunaijun.blackbox") == 0);
+    env->ReleaseStringUTFChars((jstring) res, c);
+    if (!host) return (jstring) res;
+    const char* guest = guestPkg();
+    if (!guest || !guest[0]) return (jstring) res;
+    jstring fixed = env->NewStringUTF(guest);
+    if (!fixed) { env->ExceptionClear(); return (jstring) res; }
+    if (g_strHits.fetch_add(1) < 8) {
+        char lib[80];
+        libOf(__builtin_return_address(0), lib, sizeof(lib));
+        char b[200];
+        snprintf(b, sizeof(b), "host string -> %s caller=%s", guest, lib);
+        nlogCrit("jni", b);
+    }
+    return fixed;
+}
+
+static jobject JNICALL hookObjV(JNIEnv* env, jobject o, jmethodID m, va_list a) {
+    if (!g_origObjV) return nullptr;
+    return rewriteHostString(env, g_origObjV(env, o, m, a));
+}
+static jobject JNICALL hookObjA(JNIEnv* env, jobject o, jmethodID m, const jvalue* a) {
+    if (!g_origObjA) return nullptr;
+    return rewriteHostString(env, g_origObjA(env, o, m, a));
+}
+static jobject JNICALL hookNvObjV(JNIEnv* env, jobject o, jclass c, jmethodID m, va_list a) {
+    if (!g_origNvObjV) return nullptr;
+    return rewriteHostString(env, g_origNvObjV(env, o, c, m, a));
+}
+static jobject JNICALL hookNvObjA(JNIEnv* env, jobject o, jclass c, jmethodID m, const jvalue* a) {
+    if (!g_origNvObjA) return nullptr;
+    return rewriteHostString(env, g_origNvObjA(env, o, c, m, a));
+}
+static jobject JNICALL hookStObjV(JNIEnv* env, jclass c, jmethodID m, va_list a) {
+    if (!g_origStObjV) return nullptr;
+    return rewriteHostString(env, g_origStObjV(env, c, m, a));
+}
+static jobject JNICALL hookStObjA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    if (!g_origStObjA) return nullptr;
+    return rewriteHostString(env, g_origStObjA(env, c, m, a));
+}
+
+// One page covers every slot above (highest is 116, byte offset 928).
+static bool patchSlot(void** vt, int slot, void* repl, void** save, const char* what) {
+    if (vt[slot] == repl) return true;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) page = 4096;
+    uintptr_t addr = (uintptr_t) &vt[slot];
+    void* pg = (void*) (addr & ~(uintptr_t) (page - 1));
+    if (mprotect(pg, (size_t) page, PROT_READ | PROT_WRITE) != 0) {
+        char b[96];
+        snprintf(b, sizeof(b), "mprotect %s errno=%d", what, errno);
+        nlogCrit("jni", b);
+        return false;
+    }
+    if (save) *save = vt[slot];
+    vt[slot] = repl;
+    return true;
+}
+
 void installJniBridge() {
     if (g_origRegNatives) return;
     JNIEnv* env = nullptr;
@@ -1628,19 +1731,30 @@ void installJniBridge() {
     }
     if (vt[215] == (void*) hookRegNatives) return;
 
-    long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) page = 4096;
-    uintptr_t slot = (uintptr_t) &vt[215];
-    void* pg = (void*) (slot & ~(uintptr_t) (page - 1));
-    if (mprotect(pg, (size_t) page, PROT_READ | PROT_WRITE) != 0) {
-        char b[80];
-        snprintf(b, sizeof(b), "mprotect errno=%d", errno);
-        nlogCrit("jni", b);
-        return;
+    // The string class must be a global ref: it outlives any local frame.
+    jclass sc = env->FindClass("java/lang/String");
+    if (sc) {
+        g_strCls = (jclass) env->NewGlobalRef(sc);
+        env->DeleteLocalRef(sc);
     }
-    g_origRegNatives = (regNativesFn) vt[215];
-    vt[215] = (void*) hookRegNatives;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    patchSlot(vt, 215, (void*) hookRegNatives, (void**) &g_origRegNatives,
+              "RegisterNatives");
+
+    bool ok = true;
+    ok &= patchSlot(vt, 35,  (void*) hookObjV,   (void**) &g_origObjV,   "CallObjectMethodV");
+    ok &= patchSlot(vt, 36,  (void*) hookObjA,   (void**) &g_origObjA,   "CallObjectMethodA");
+    ok &= patchSlot(vt, 65,  (void*) hookNvObjV, (void**) &g_origNvObjV, "CallNonvirtualObjectMethodV");
+    ok &= patchSlot(vt, 66,  (void*) hookNvObjA, (void**) &g_origNvObjA, "CallNonvirtualObjectMethodA");
+    ok &= patchSlot(vt, 115, (void*) hookStObjV, (void**) &g_origStObjV, "CallStaticObjectMethodV");
+    ok &= patchSlot(vt, 116, (void*) hookStObjA, (void**) &g_origStObjA, "CallStaticObjectMethodA");
+
     nlogCrit("hook", "JNI RegisterNatives");
+    char b[200];
+    snprintf(b, sizeof(b), "JNI string rewrite strcls=%d ok=%d",
+             g_strCls ? 1 : 0, ok ? 1 : 0);
+    nlogCrit("hook", b);
 }
 
 } // namespace
