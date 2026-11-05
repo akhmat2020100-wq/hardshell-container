@@ -220,6 +220,7 @@ void traceLib(const char* tag, const char* s, void* ret) {
 }
 
 void logJavaStack();
+void nativeStack();
 
 // prio is ANDROID_LOG_*: UNKNOWN=0, DEFAULT=1, VERBOSE=2, DEBUG=3,
 // INFO=4, WARN=5, ERROR=6, FATAL=7. The old table indexed from 0 and
@@ -243,6 +244,7 @@ void emitLogLine(int prio, const char* tag, const char* msg) {
     // Whatever produced that string is the leak - trace it once, at the source.
     if (strstr(msg, "getPackageName") && strstr(tag, "Kumiho") && !g_pkgTrace.exchange(true)) {
         logJavaStack();
+        nativeStack();
     }
     if (g_lcatBudget.fetch_sub(1) <= 0) return;
     size_t n = strlen(msg);
@@ -399,6 +401,32 @@ void logJavaStack() {
     }
     env->ExceptionClear();
     env->PopLocalFrame(nullptr);
+}
+
+// Same idea one layer down: which .so actually emitted the Kumiho line. The
+// Java stack showed Unity's BitmapFactory, so the caller is native - this
+// names the library and the offset inside it.
+struct NTrace {
+    int depth;
+};
+
+static _Unwind_Reason_Code ntCb(struct _Unwind_Context* ctx, void* arg) {
+    NTrace* st = (NTrace*) arg;
+    uintptr_t pc = (uintptr_t) _Unwind_GetIP(ctx);
+    if (!pc) return _URC_NO_REASON;
+    char lib[120];
+    libOf((void*) pc, lib, sizeof(lib));
+    char b[220];
+    snprintf(b, sizeof(b), "nbt #%d %p @%s", st->depth, (void*) pc,
+             lib[0] ? lib : "?");
+    trace("nbt", b);
+    st->depth++;
+    return st->depth >= 12 ? _URC_END_OF_STACK : _URC_NO_REASON;
+}
+
+void nativeStack() {
+    NTrace st = {0};
+    _Unwind_Backtrace(ntCb, &st);
 }
 
 struct BtState {
@@ -971,11 +999,18 @@ void installCrashHandler() {
 // ---------------------------------------------------------------------------
 // heartbeat: proves when the process stopped breathing
 // ---------------------------------------------------------------------------
+static void jniStrStats(char* out, size_t cap);
+
 void* hbThread(void*) {
     for (int i = 0; i < 90 && !g_hbStop.load(); i++) {
         char b[32];
         snprintf(b, sizeof(b), "hb %d", i);
         nlogRaw("alive", b);
+        if ((i % 5) == 4) {
+            char s[96];
+            jniStrStats(s, sizeof(s));
+            nlogCrit("jni", s);
+        }
         struct timespec ts;
         ts.tv_sec = 2;
         ts.tv_nsec = 0;
@@ -1007,6 +1042,11 @@ const char* kProps[][2] = {
     {"ro.boot.warranty_bit",        "0"},
     {"ro.warranty_bit",             "0"},
     {"service.adb.root",            "0"},
+    // Kumiho asks for these two before it walks the package list. Answering
+    // them as "disabled" is the documented off-switch for the SDK; an absent
+    // prop (getprop returns 0) is what lets it continue into the scan.
+    {"persist.kumiho.disabled",     "true"},
+    {"persist.thirdparty.disabled", "true"},
 };
 
 const char* kHiddenProps[] = {
@@ -1237,19 +1277,34 @@ int hookPropGet(const char* key, char* out) {
         return r;
     }
     trace("prop", key);
+    int rc = -1;
     if (modeOn(M_PROPS)) {
+        rc = -2;
         for (const char* h : kHiddenProps) {
-            if (strcmp(key, h) == 0) { if (out) out[0] = '\0'; return 0; }
+            if (strcmp(key, h) == 0) { if (out) out[0] = '\0'; rc = 0; break; }
         }
-        for (const auto& p : kProps) {
-            if (strcmp(key, p[0]) == 0) {
-                size_t n = strlen(p[1]);
-                if (out) memcpy(out, p[1], n + 1);
-                return (int)n;
+        if (rc == -2) {
+            for (const auto& p : kProps) {
+                if (strcmp(key, p[0]) == 0) {
+                    size_t n = strlen(p[1]);
+                    if (out) memcpy(out, p[1], n + 1);
+                    rc = (int) n;
+                    break;
+                }
             }
         }
+        if (rc == -2) rc = origPropGet ? origPropGet(key, out) : 0;
+    } else {
+        rc = origPropGet ? origPropGet(key, out) : 0;
     }
-    return origPropGet ? origPropGet(key, out) : 0;
+    // The two Kumiho switches decide whether the SDK proceeds into its scan,
+    // so their answered value is worth one line each launch.
+    if (strstr(key, "kumiho") || strstr(key, "thirdparty")) {
+        char b[200];
+        snprintf(b, sizeof(b), "%s=%s rc=%d", key, out ? out : "", rc);
+        nlogCrit("prop", b);
+    }
+    return rc;
 }
 
 const void* hookPropFind(const char* key) {
@@ -1694,6 +1749,14 @@ static jobject JNICALL hookStObjV(JNIEnv* env, jclass c, jmethodID m, va_list a)
 static jobject JNICALL hookStObjA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
     if (!g_origStObjA) return nullptr;
     return rewriteHostString(env, g_origStObjA(env, c, m, a));
+}
+
+// Read by the heartbeat so one log line tells us whether the object-return
+// hooks are in the path at all. calls==0 means native never used these slots
+// and the leak reaches Kumiho by some other route.
+static void jniStrStats(char* out, size_t cap) {
+    snprintf(out, cap, "strCalls=%d hits=%d",
+             g_strCalls.load(), g_strHits.load());
 }
 
 // One page covers every slot above (highest is 116, byte offset 928).
