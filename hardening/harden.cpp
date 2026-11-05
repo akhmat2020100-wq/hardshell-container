@@ -35,6 +35,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
 #include <sys/utsname.h>
@@ -461,9 +462,140 @@ void writeNamed(const char* dir, const char* name, const void* p, size_t len) {
     nlogRaw("DUMP", b);
 }
 
+// ---------------------------------------------------------------------------
+// The verdict lives in a dex decrypted into the guest heap, so it is nowhere
+// on disk. Read it through process_vm_readv: unlike a raw pointer walk, a
+// hole in the heap returns EFAULT instead of taking the process down with
+// SIGSEGV/SIGBUS — which is exactly how the first scanner killed itself.
+// A candidate only counts once the whole dex header checks out, and the
+// string table decides which one is worth keeping.
+// ---------------------------------------------------------------------------
+static std::atomic<int> g_vmMode{-1};   // -1 untried, 0 process_vm_readv, 1 /proc/self/mem
+static int g_memFd = -1;
+
+static ssize_t vmRead(void* dst, uintptr_t src, size_t len) {
+    if (!len) return 0;
+    if (g_vmMode.load() != 1) {
+        struct iovec li;
+        struct iovec ri;
+        li.iov_base = dst;
+        li.iov_len = len;
+        ri.iov_base = (void*)src;
+        ri.iov_len = len;
+        long r = syscall(SYS_process_vm_readv, getpid(), &li, 1, &ri, 1, 0);
+        if (r >= 0) {
+            g_vmMode.store(0);
+            return (ssize_t)r;
+        }
+        if (g_vmMode.load() == 0) return -1;   // worked before: real hole
+    }
+    if (g_memFd < 0) {
+        g_memFd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem",
+                               O_RDONLY | O_CLOEXEC);
+        if (g_memFd < 0) return -1;
+    }
+    g_vmMode.store(1);
+    return (ssize_t)syscall(SYS_pread64, g_memFd, dst, len, (off_t)src);
+}
+
+// Best-effort read: a bad page is zero-filled instead of ending the sweep.
+static void readLoose(uintptr_t addr, unsigned char* dst, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        size_t want = len - got;
+        if (want > (size_t)(64 * 1024)) want = (size_t)(64 * 1024);
+        ssize_t r = vmRead(dst + got, addr + got, want);
+        if (r == (ssize_t)want) { got += want; continue; }
+        if (r > 0) { got += (size_t)r; want -= (size_t)r; }
+        size_t p = 0;
+        while (p < want) {
+            size_t n2 = want - p;
+            if (n2 > 4096) n2 = 4096;
+            if (vmRead(dst + got + p, addr + got + p, n2) != (ssize_t)n2)
+                memset(dst + got + p, 0, n2);
+            p += n2;
+        }
+        got += want;
+    }
+}
+
+struct DexHead {
+    uint32_t fileSize;
+    uint32_t headerSize;
+    uint32_t endian;
+    uint32_t stringIdsSize;
+    uint32_t stringIdsOff;
+    uint32_t typeIdsSize;
+    uint32_t typeIdsOff;
+    uint32_t classDefsSize;
+    uint32_t classDefsOff;
+};
+
+static bool dexHeadOk(uintptr_t addr, DexHead* out) {
+    unsigned char h[0x70];
+    readLoose(addr, h, sizeof(h));
+    if (memcmp(h, "dex\n", 4) != 0) return false;
+    if (h[7] != 0) return false;
+    for (int i = 4; i < 7; i++)
+        if (h[i] < '0' || h[i] > '9') return false;
+    DexHead d;
+    memset(&d, 0, sizeof(d));
+    memcpy(&d.fileSize, h + 0x20, 4);
+    memcpy(&d.headerSize, h + 0x24, 4);
+    memcpy(&d.endian, h + 0x28, 4);
+    memcpy(&d.stringIdsSize, h + 0x38, 4);
+    memcpy(&d.stringIdsOff, h + 0x3C, 4);
+    memcpy(&d.typeIdsSize, h + 0x40, 4);
+    memcpy(&d.typeIdsOff, h + 0x44, 4);
+    memcpy(&d.classDefsSize, h + 0x60, 4);
+    memcpy(&d.classDefsOff, h + 0x64, 4);
+    if (d.endian != 0x12345678u) return false;
+    if (d.headerSize != 0x70u) return false;
+    if (d.fileSize < 0x70u || d.fileSize > (64u << 20)) return false;
+    if (d.stringIdsSize == 0) return false;
+    if (d.stringIdsOff >= d.fileSize) return false;
+    if ((uint64_t)d.stringIdsOff + (uint64_t)d.stringIdsSize * 4 > d.fileSize) return false;
+    if (d.typeIdsSize &&
+        (uint64_t)d.typeIdsOff + (uint64_t)d.typeIdsSize * 4 > d.fileSize) return false;
+    if (d.classDefsSize &&
+        (uint64_t)d.classDefsOff + (uint64_t)d.classDefsSize * 32 > d.fileSize) return false;
+    *out = d;
+    return true;
+}
+
+// How many entries of the dex string table mention the verdict classes.
+static int dexNeedles(const unsigned char* d, size_t n, const DexHead& h) {
+    int m = 0;
+    uint32_t cap = h.stringIdsSize;
+    if (cap > 120000) cap = 120000;
+    for (uint32_t i = 0; i < cap; i++) {
+        uint32_t off;
+        memcpy(&off, d + h.stringIdsOff + (size_t)i * 4, 4);
+        if (off >= n) continue;
+        size_t p = off;
+        uint32_t slen = 0;
+        int shift = 0;
+        for (int k = 0; k < 5 && p < n; k++) {
+            unsigned char b = d[p++];
+            slen |= (uint32_t)(b & 0x7f) << shift;
+            shift += 7;
+            if (!(b & 0x80)) break;
+        }
+        size_t avail = n - p;
+        if (slen < avail) avail = slen;        // ASCII: uleb length == byte length
+        if (avail > 400) avail = 400;
+        const unsigned char* s = d + p;
+        if (memmem(s, avail, "qnxUk1", 6) ||
+            memmem(s, avail, "LqnxUk1", 7) ||
+            memmem(s, avail, "Kumiho", 6)) m++;
+    }
+    return m;
+}
+
 void dumpDecryptedDex() {
     if (g_dexDump.exchange(true)) return;
-    nlogRaw("DUMP", "start");
+    nlogRaw("DUMP", "start v2");
+
     char dir[256] = {0};
     char link[64];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", g_logFd);
@@ -473,9 +605,7 @@ void dumpDecryptedDex() {
         char* slash = strrchr(dir, '/');
         if (slash) *slash = 0;
     }
-    if (!dir[0]) {
-        snprintf(dir, sizeof(dir), "/storage/emulated/0/Download");
-    }
+    if (!dir[0]) snprintf(dir, sizeof(dir), "/storage/emulated/0/Download");
     nlogRaw("DUMP", dir);
 
     int mfd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY | O_CLOEXEC);
@@ -489,100 +619,115 @@ void dumpDecryptedDex() {
     }
     syscall(SYS_close, mfd);
     if (mbS.empty()) { nlogRaw("DUMP", "maps read failed"); return; }
-    const char* mb = mbS.c_str();
-    {
-        char first[140];
-        snprintf(first, sizeof(first), "first=%.110s", mb);
-        nlogRaw("DUMP", first);
-    }
-    writeNamed(dir, "ofxmaps.txt", mb, mbS.size());
+    writeNamed(dir, "ofxmaps.txt", mbS.data(), mbS.size());
 
-    // Four needles, most specific first. The tag string is the one the SDK
-    // itself prints; it can only live in the decrypted dex or the native
-    // string pool of the loader, never in our Java stack traces.
-    static const char* kNd[] = {"Kumiho-Kumiho", "LqnxUk1", "qnxUk1", "dex\n035"};
-    static const size_t kNl[] = {13, 7, 6, 8};
-    int hits[4] = {0, 0, 0, 0};
+    const size_t CHUNK = (size_t)1 << 20;
+    const size_t OVER = 16;
+    const size_t SCAN_CAP = (size_t)900 << 20;
+    const size_t REG_CAP = (size_t)384 << 20;
 
-    int idx = 0;
-    int regions = 0;
-    int lines = 0;
+    unsigned char* buf = (unsigned char*)malloc(CHUNK + OVER);
+    if (!buf) { nlogRaw("DUMP", "no scan buffer"); return; }
+
+    int regions = 0, cands = 0, otherDumps = 0, matchDumps = 0;
     size_t scanned = 0;
-    size_t pos = 0;
-    const size_t msz = mbS.size();
-    while (pos < msz) {
+    const char* mb = mbS.c_str();
+    size_t pos = 0, msz = mbS.size();
+
+    while (pos < msz && scanned < SCAN_CAP) {
         const char* ls = mb + pos;
         const char* nl = strchr(ls, '\n');
         size_t llen = nl ? (size_t)(nl - ls) : (msz - pos);
         std::string line(ls, llen);
-        lines++;
-        // split: start-end perms offset dev inode path
         size_t dash = line.find('-');
         size_t sp = line.find(' ');
         if (dash != std::string::npos && sp != std::string::npos) {
-            unsigned long long s = strtoull(line.c_str(), nullptr, 16);
-            unsigned long long e = strtoull(line.c_str() + dash + 1, nullptr, 16);
-            while (sp < line.size() && line[sp] == ' ') sp++;
-            char perms[8] = {0};
-            size_t pe = line.find(' ', sp);
+            uintptr_t s = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
+            uintptr_t e = (uintptr_t)strtoull(line.c_str() + dash + 1, nullptr, 16);
+            size_t tsp = sp;
+            while (tsp < line.size() && line[tsp] == ' ') tsp++;
+            size_t pe = line.find(' ', tsp);
             if (pe == std::string::npos) pe = line.size();
-            size_t pc = pe - sp;
+            char perms[8] = {0};
+            size_t pc = pe - tsp;
             if (pc > 7) pc = 7;
-            memcpy(perms, line.data() + sp, pc);
-            char* path = nullptr;
+            memcpy(perms, line.data() + tsp, pc);
+            const char* path = "";
             size_t ps = pe;
             int fields = 0;
             while (ps < line.size() && fields < 3) {
-                if (line[ps] == ' ') { fields++; while (ps < line.size() && line[ps] == ' ') ps++; }
-                else ps++;
-            }
-            if (ps < line.size()) path = (char*)line.c_str() + ps;
-            size_t len = (size_t)(e - s);
-            if (e > s && perms[0] == 'r') {
-                size_t scanLen = len;
-                if (scanLen > (size_t)512 * 1024 * 1024) scanLen = (size_t)512 * 1024 * 1024;
-                const unsigned char* p = (const unsigned char*)(uintptr_t)s;
-                regions++;
-                scanned += scanLen;
-                if (len >= (4u << 20) && lines < 400) {
-                    char rb[320];
-                    snprintf(rb, sizeof(rb), "reg size=%zu perms=%s path=%.150s",
-                             len, perms, path ? path : "-");
-                    nlogRaw("DUMP", rb);
+                if (line[ps] == ' ') {
+                    fields++;
+                    while (ps < line.size() && line[ps] == ' ') ps++;
+                } else {
+                    ps++;
                 }
-                for (int n = 0; n < 4; n++) {
-                    const unsigned char* from = p;
-                    size_t left = scanLen;
-                    int perRegion = 0;
-                    while (left >= kNl[n] && perRegion < 2) {
-                        const unsigned char* h = (const unsigned char*)
-                                memmem(from, left, kNd[n], kNl[n]);
-                        if (!h) break;
-                        perRegion++;
-                        hits[n]++;
-                        size_t hpos = (size_t)(h - p);
-                        char hb[340];
-                        snprintf(hb, sizeof(hb), "hit n=%d off=0x%zx addr=%p perms=%s path=%.120s",
-                                 n, hpos, (void*)h, perms, path ? path : "-");
-                        nlogRaw("DUMP", hb);
-                        if (n < 3 && idx < 8) {
-                            size_t back = hpos > (8u << 20) ? hpos - (8u << 20) : 0;
-                            size_t wlen = scanLen - back;
-                            if (wlen > (16u << 20)) wlen = (16u << 20);
-                            writeDump(dir, idx++, p + back, wlen);
+            }
+            if (ps < line.size()) path = line.c_str() + ps;
+
+            // Anonymous memory only: disk images are mapped from files and
+            // cannot hold the decrypted payload. Free-list holes are fine
+            // here, the read path returns EFAULT instead of dying.
+            bool anon = (path[0] == 0) || (path[0] == '[');
+            if (perms[0] == 'r' && anon && e > s) {
+                size_t len = (size_t)(e - s);
+                if (len > REG_CAP) len = REG_CAP;
+                regions++;
+                size_t rp = 0;
+                while (rp < len && scanned < SCAN_CAP) {
+                    size_t want = len - rp;
+                    if (want > CHUNK + OVER) want = CHUNK + OVER;
+                    readLoose(s + rp, buf, want);
+                    size_t off = 0;
+                    while (off + 8 <= want) {
+                        unsigned char* m = (unsigned char*)memmem(buf + off, want - off, "dex\n", 4);
+                        if (!m) break;
+                        size_t i = (size_t)(m - buf);
+                        uintptr_t ca = s + rp + i;
+                        DexHead h;
+                        if (dexHeadOk(ca, &h)) {
+                            cands++;
+                            unsigned char* dex = (unsigned char*)malloc(h.fileSize);
+                            if (dex) {
+                                readLoose(ca, dex, h.fileSize);
+                                int mcount = dexNeedles(dex, h.fileSize, h);
+                                char b[300];
+                                snprintf(b, sizeof(b),
+                                         "cand addr=0x%llx size=%u strings=%u match=%d",
+                                         (unsigned long long)ca, h.fileSize,
+                                         h.stringIdsSize, mcount);
+                                nlogRaw("DUMP", b);
+                                if (mcount > 0) {
+                                    if (matchDumps < 4) {
+                                        char nm[48];
+                                        snprintf(nm, sizeof(nm), "ofxqnx_%d.dex", matchDumps);
+                                        writeNamed(dir, nm, dex, h.fileSize);
+                                        matchDumps++;
+                                    }
+                                } else if (otherDumps < 3) {
+                                    char nm[48];
+                                    snprintf(nm, sizeof(nm), "ofxother_%d.dex", otherDumps);
+                                    writeNamed(dir, nm, dex, h.fileSize);
+                                    otherDumps++;
+                                }
+                                free(dex);
+                            }
                         }
-                        left -= (size_t)(h - from) + kNl[n];
-                        from = h + kNl[n];
+                        off = i + 4;
                     }
+                    rp += CHUNK;
+                    scanned += want;
                 }
             }
         }
         if (!nl) break;
         pos += (size_t)(nl - ls) + 1;
     }
-    char b[300];
-    snprintf(b, sizeof(b), "lines=%d regions=%d kumiho=%d Lqnx=%d qnx=%d dex=%d written=%d scanned=%zu bytes=%zu",
-             lines, regions, hits[0], hits[1], hits[2], hits[3], idx, scanned, msz);
+    free(buf);
+
+    char b[260];
+    snprintf(b, sizeof(b), "done regions=%d cands=%d matchDumps=%d other=%d scanned=%zu mode=%d",
+             regions, cands, matchDumps, otherDumps, scanned, g_vmMode.load());
     nlogRaw("DUMP", b);
 }
 
@@ -601,7 +746,16 @@ void killTrace(const char* fn, pid_t pid, int sig) {    const bool self = (pid =
         logJavaStack();
         BtState st = {0};
         _Unwind_Backtrace(btCb, &st);
-        dumpDecryptedDex();
+        // The sweep touches the whole guest heap; keep it off the thread the
+        // app is waiting on so a slow scan cannot turn into an ANR.
+        pthread_t th;
+        if (pthread_create(&th, nullptr,
+                           [](void*) -> void* { dumpDecryptedDex(); return nullptr; },
+                           nullptr) == 0) {
+            pthread_detach(th);
+        } else {
+            dumpDecryptedDex();
+        }
     }
 }
 
