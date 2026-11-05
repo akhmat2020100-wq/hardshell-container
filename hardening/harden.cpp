@@ -455,12 +455,16 @@ void dumpDecryptedDex() {
 
     int mfd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY | O_CLOEXEC);
     if (mfd < 0) { nlogRaw("DUMP", "maps open failed"); return; }
-    char* mb = (char*)malloc(1024 * 1024);
-    if (!mb) { syscall(SYS_close, mfd); return; }
-    ssize_t mn = (ssize_t)syscall(SYS_read, mfd, mb, 1024 * 1024 - 1);
+    std::string mbS;
+    {
+        char buf[8192];
+        ssize_t n;
+        while ((n = syscall(SYS_read, mfd, buf, sizeof(buf))) > 0)
+            mbS.append(buf, (size_t)n);
+    }
     syscall(SYS_close, mfd);
-    if (mn <= 0) { free(mb); nlogRaw("DUMP", "maps read failed"); return; }
-    mb[mn] = 0;
+    if (mbS.empty()) { nlogRaw("DUMP", "maps read failed"); return; }
+    const char* mb = mbS.c_str();
     {
         char first[120];
         snprintf(first, sizeof(first), "%.100s", mb);
@@ -472,10 +476,16 @@ void dumpDecryptedDex() {
     int needles = 0;
     int lines = 0;
     size_t scanned = 0;
-    char* line = mb;
-    while (line && *line && idx < 10) {
-        char* nl = strchr(line, '\n');
-        if (nl) *nl = 0;
+    size_t pos = 0;
+    const size_t msz = mbS.size();
+    while (pos < msz && idx < 10) {
+        const char* ls = mb + pos;
+        const char* nl = strchr(ls, '\n');
+        size_t llen = nl ? (size_t)(nl - ls) : (msz - pos);
+        char line[512];
+        if (llen >= sizeof(line)) llen = sizeof(line) - 1;
+        memcpy(line, ls, llen);
+        line[llen] = 0;
         lines++;
         char* dash = strchr(line, '-');
         if (dash) {
@@ -487,7 +497,7 @@ void dumpDecryptedDex() {
             if (e > s && sp[0] == 'r') {
                 size_t len = (size_t)(e - s);
                 size_t scanLen = len;
-                if (scanLen > (size_t)256 * 1024 * 1024) scanLen = (size_t)256 * 1024 * 1024;
+                if (scanLen > (size_t)512 * 1024 * 1024) scanLen = (size_t)512 * 1024 * 1024;
                 const unsigned char* p = (const unsigned char*)(uintptr_t)s;
                 regions++;
                 scanned += scanLen;
@@ -495,17 +505,17 @@ void dumpDecryptedDex() {
                         memmem(p, scanLen, "LqnxUk1", 7);
                 if (hit) {
                     needles++;
-                    size_t pos = (size_t)(hit - p);
-                    size_t back = pos > (8u << 20) ? pos - (8u << 20) : 0;
+                    size_t hpos = (size_t)(hit - p);
+                    size_t back = hpos > (8u << 20) ? hpos - (8u << 20) : 0;
                     size_t wlen = scanLen - back;
                     if (wlen > (16u << 20)) wlen = (16u << 20);
                     writeDump(dir, idx++, p + back, wlen);
                 }
             }
         }
-        line = nl ? nl + 1 : nullptr;
+        if (!nl) break;
+        pos += (size_t)(nl - ls) + 1;
     }
-    free(mb);
     char b[240];
     snprintf(b, sizeof(b), "lines=%d regions=%d qnx=%d written=%d scanned=%zu",
              lines, regions, needles, idx, scanned);
