@@ -224,6 +224,7 @@ jobs:
                       "                try { top.niunaijun.blackbox.util.OfxPatch.preBindApplication(packageContext); } catch (Throwable t0) { OfxLog.log(\"preBind outer \" + t0); }\n"
                       "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);\n"
                       '                OfxLog.log("makeApplication done " + (application != null));\n'
+                      "                try { top.niunaijun.blackbox.util.OfxPatch.appCreated(); } catch (Throwable t0) { }\n"
                       "                try {\n"
                       "                    android.content.pm.ApplicationInfo ai2 = (application == null) ? null : application.getApplicationInfo();\n"
                       "                    OfxLog.log(\"id \" + (ai2 == null ? \"null\" : (\"src=\" + ai2.sourceDir + \" data=\" + ai2.dataDir + \" lib=\" + ai2.nativeLibraryDir + \" uid=\" + ai2.uid + \" myuid=\" + android.os.Process.myUid() + \" pkg=\" + ai2.packageName)));\n"

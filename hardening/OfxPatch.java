@@ -34,6 +34,14 @@ public final class OfxPatch {
     private static volatile String cachedMode;
     private static volatile String cachedSource = "default";
     private static volatile int homeFlag = -1;
+    /** Set after the guest Application.onCreate has finished; scrubbing before
+     *  that point corrupts the objects the framework uses to build the
+     *  process (IOCore map + createPackageContext), so results stay real. */
+    private static volatile boolean booted = false;
+
+    public static void appCreated() {
+        booted = true;
+    }
 
     private OfxPatch() {
     }
@@ -100,16 +108,13 @@ public final class OfxPatch {
         homeEnabled();
         keepAlive();
         blockedClass(null);
-        scrub(info);
         String mode = modeName();
         OfxLog.log("appMode=" + mode + " src=" + cachedSource + " pkg=" + packageName
                 + " proc=" + processName + " manifestClass=" + info.className);
-        if ("real".equals(mode)) {
-            OfxLog.log("appMode keeps manifest Application");
-            return info;
-        }
-        info.className = DEFAULT_APP_CLASS;
-        OfxLog.log("appMode Application -> " + info.className);
+        // Never touch className or dataDir here. AppDome's manifest Application
+        // loads libloader.so and registers its JNI methods; replacing it made
+        // Unity die with UnsatisfiedLinkError, and rewriting dataDir before
+        // IOCore.enableRedirect turned the path map into a no-op (EACCES).
         return info;
     }
 
@@ -327,7 +332,7 @@ public final class OfxPatch {
      * owns the redirect for these names, so file access is unaffected.
      */
     public static void scrub(ApplicationInfo ai) {
-        if (ai == null || !homeEnabled()) {
+        if (ai == null || !homeEnabled() || !booted) {
             return;
         }
         try {
@@ -371,39 +376,57 @@ public final class OfxPatch {
      * reflection because its getList() is the only public view of the items.
      */
     public static Object scrubResult(Object result) {
-        if (result == null || !homeEnabled()) {
+        if (result == null || !homeEnabled() || !booted) {
             return result;
         }
         try {
             if (result instanceof android.content.pm.PackageInfo) {
-                scrub(((android.content.pm.PackageInfo) result).applicationInfo);
-            } else if (result instanceof ApplicationInfo) {
-                scrub((ApplicationInfo) result);
-            } else if (result instanceof java.util.List) {
-                for (Object o : (java.util.List<?>) result) {
-                    scrubItem(o);
-                }
-            } else if (result.getClass().getName().startsWith("android.content.pm.ParceledListSlice")) {
-                try {
-                    Object list = result.getClass().getMethod("getList").invoke(result);
-                    if (list instanceof java.util.List) {
-                        for (Object o : (java.util.List<?>) list) {
-                            scrubItem(o);
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
+                return copyPackageInfo((android.content.pm.PackageInfo) result);
             }
+            if (result instanceof ApplicationInfo) {
+                return copyApplicationInfo((ApplicationInfo) result);
+            }
+            // Lists are left alone: replacing a ParceledListSlice backing list
+            // is not safe across framework versions, and getInstalledPackages
+            // results are also used internally while activities start.
         } catch (Throwable ignored) {
         }
         return result;
     }
 
-    private static void scrubItem(Object o) {
-        if (o instanceof android.content.pm.PackageInfo) {
-            scrub(((android.content.pm.PackageInfo) o).applicationInfo);
-        } else if (o instanceof ApplicationInfo) {
-            scrub((ApplicationInfo) o);
+    private static ApplicationInfo copyApplicationInfo(ApplicationInfo ai) {
+        try {
+            android.os.Parcel p = android.os.Parcel.obtain();
+            try {
+                ai.writeToParcel(p, 0);
+                p.setDataPosition(0);
+                ApplicationInfo c = ApplicationInfo.CREATOR.createFromParcel(p);
+                scrub(c);
+                return c;
+            } finally {
+                p.recycle();
+            }
+        } catch (Throwable t) {
+            return ai;
+        }
+    }
+
+    private static android.content.pm.PackageInfo copyPackageInfo(
+            android.content.pm.PackageInfo pi) {
+        try {
+            android.os.Parcel p = android.os.Parcel.obtain();
+            try {
+                pi.writeToParcel(p, 0);
+                p.setDataPosition(0);
+                android.content.pm.PackageInfo c =
+                        android.content.pm.PackageInfo.CREATOR.createFromParcel(p);
+                scrub(c.applicationInfo);
+                return c;
+            } finally {
+                p.recycle();
+            }
+        } catch (Throwable t) {
+            return pi;
         }
     }
 
@@ -467,10 +490,10 @@ public final class OfxPatch {
         if (base == null) {
             return;
         }
-        try {
-            sanitizeEarly(base);
-        } catch (Throwable ignored) {
-        }
+        // sanitizeEarly is deliberately not called: rewriting the live
+        // ContextImpl/LoadedApk dirs to /data/user/0/<pkg> made ContextImpl
+        // mkdir fail with EACCES and native SQLite open the wrong path, which
+        // is exactly the black screen. Runtime dirs stay on the container.
         try {
             TmpApp tmp = new TmpApp();
             tmp.bind(base);

@@ -87,6 +87,7 @@ enum {
     M_PROPTRACE = 524288, // log every ro.* property and prop_info the guest asks for
     M_SYS       = 1048576,// trace libc syscall() calls made by the packer library
     M_SECCOMP   = 2097152,// seccomp-BPF: trap inline `svc` process/thread kills
+    M_SYSREDIR  = 4194304,// rewrite guest paths + spoof uid inside raw syscall()
     H_PROP      = 128,
     H_OPEN      = 256,
     H_STAT      = 512,
@@ -277,6 +278,95 @@ static bool sysInteresting(long nr) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Raw-syscall redirection.
+//
+// libloader.so reaches the kernel through libc's syscall() and therefore
+// bypasses both the libc hooks above and BlackBox's own IO redirect. Without
+// this layer it observes the container exactly as it is: real uid, container
+// paths, unsanitized /proc. These helpers mirror IOCore's Java rules.
+// ---------------------------------------------------------------------------
+bool procTarget(const char* p);
+bool scrubThisOpen(const char* p);
+int memfdFor(const std::string& data);
+std::string sanitize(const std::string& raw, const char* path);
+
+#define OFX_AT_EMPTY_PATH 0x1000
+
+static std::mutex g_fdMu;
+static int g_fdTrack[64];
+static int g_fdTrackN = 0;
+
+static void trackFd(int fd) {
+    if (fd < 0) return;
+    std::lock_guard<std::mutex> lk(g_fdMu);
+    for (int i = 0; i < g_fdTrackN; i++) if (g_fdTrack[i] == fd) return;
+    if (g_fdTrackN < 64) g_fdTrack[g_fdTrackN++] = fd;
+}
+
+static bool trackedFd(int fd) {
+    std::lock_guard<std::mutex> lk(g_fdMu);
+    for (int i = 0; i < g_fdTrackN; i++) if (g_fdTrack[i] == fd) return true;
+    return false;
+}
+
+static void untrackFd(int fd) {
+    std::lock_guard<std::mutex> lk(g_fdMu);
+    for (int i = 0; i < g_fdTrackN; i++) {
+        if (g_fdTrack[i] == fd) {
+            g_fdTrack[i] = g_fdTrack[g_fdTrackN - 1];
+            g_fdTrackN--;
+            return;
+        }
+    }
+}
+
+// Guest-visible path -> real container path, mirroring IOCore.redirectPath.
+static bool guestRedirect(const char* in, char* out, size_t cap) {
+    if (!in || in[0] != '/') return false;
+    if (strstr(in, "/top.niunaijun.blackbox/") || strstr(in, "/blackbox/data/user/")) return false;
+    const char* pkg = guestPkg();
+    std::string root = "/data/user/0/top.niunaijun.blackbox/blackbox";
+    std::string ext = "/storage/emulated/0/Android/data/top.niunaijun.blackbox/files/blackbox/storage/emulated/0";
+    std::string s(in);
+    std::string p1 = std::string("/data/user/0/") + pkg;
+    std::string p2 = std::string("/data/data/") + pkg;
+    std::string p3 = std::string("/data/user_de/0/") + pkg;
+    std::string ps = "/storage/emulated/0";
+    std::string to;
+    if (s == p1 || s.compare(0, p1.size() + 1, p1 + "/") == 0) {
+        to = root + "/data/user/0/" + pkg + s.substr(p1.size());
+    } else if (s == p2 || s.compare(0, p2.size() + 1, p2 + "/") == 0) {
+        to = root + "/data/user/0/" + pkg + s.substr(p2.size());
+    } else if (s == p3 || s.compare(0, p3.size() + 1, p3 + "/") == 0) {
+        to = root + "/data/user_de/0/" + pkg + s.substr(p3.size());
+    } else if (s == ps || s.compare(0, ps.size() + 1, ps + "/") == 0) {
+        to = ext + s.substr(ps.size());
+    } else if (s == "/sdcard" || s.compare(0, 8, "/sdcard/") == 0) {
+        to = ext + s.substr(7);
+    } else {
+        return false;
+    }
+    if (to.size() + 1 > cap) return false;
+    memcpy(out, to.c_str(), to.size() + 1);
+    return true;
+}
+
+// Read a /proc file through the real kernel, sanitize it, and hand back a
+// read-only memfd. The packer cannot tell the difference between this fd and
+// the file it just opened; /proc inode numbers are not part of any check.
+static int sysProcFd(const char* path) {
+    long in = g_origSyscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0);
+    if (in < 0) return -1;
+    std::string raw;
+    char buf[16384];
+    long n;
+    while ((n = g_origSyscall(SYS_read, (int) in, buf, sizeof(buf))) > 0)
+        raw.append(buf, (size_t) n);
+    g_origSyscall(SYS_close, (int) in);
+    return memfdFor(sanitize(raw, path));
+}
+
 static long hookSyscall(long nr, ...) {
     va_list ap;
     va_start(ap, nr);
@@ -285,30 +375,113 @@ static long hookSyscall(long nr, ...) {
     va_end(ap);
 
     if (!g_origSyscall) return -1;
-    if (t_inSyscall || !sysInteresting(nr))
+    if (t_inSyscall)
         return g_origSyscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
 
+    const bool redir = modeOn(M_SYSREDIR);
+    bool packer = false;
+    if (redir) {
+        char caller[140];
+        caller[0] = '\0';
+        libOf(__builtin_return_address(0), caller, sizeof(caller));
+        packer = strstr(caller, "libloader") != nullptr;
+    }
+
+    // libloader reaches the kernel here, past the libc getuid/geteuid hooks.
+    if (redir && (nr == 174 || nr == 175))
+        return (long) g_guestUid;
+
     t_inSyscall = 1;
-    char lib[140];
-    libOf(__builtin_return_address(0), lib, sizeof(lib));
-    if (strstr(lib, "libloader") != nullptr) {
-        const char* p = nullptr;
-        if (sysHasPath(nr)) p = (const char*) (nr == 221 ? a[0] : a[1]);
-        char key[320];
-        if (p) snprintf(key, sizeof(key), "s%d|%.240s", (int) nr, p);
-        else   snprintf(key, sizeof(key), "s%d|%ld|%ld", (int) nr, a[0], a[1]);
-        if (firstTime(key)) {
-            g_sysSeen.fetch_add(1);
-            char b[460];
-            if (p) snprintf(b, sizeof(b), "nr=%d %.230s @%s", (int) nr, p, lib);
-            else   snprintf(b, sizeof(b), "nr=%d a0=%ld a1=%ld @%s",
-                            (int) nr, a[0], a[1], lib);
-            nlogCrit("sys", b);
+
+    char origPath[768];
+    origPath[0] = '\0';
+    char xpath[768];
+    bool translated = false;
+    int pathIdx = -1;
+
+    if (sysHasPath(nr)) {
+        pathIdx = (nr == 221) ? 0 : 1;
+        const char* p = (const char*) (uintptr_t) a[pathIdx];
+        if (p) {
+            snprintf(origPath, sizeof(origPath), "%s", p);
+            if (redir && packer && nr != 221 && nr != 281) {
+                if ((nr == 56 || nr == 437) && scrubThisOpen(p)
+                        && (nr != 56 || a[0] == AT_FDCWD)) {
+                    int fd = sysProcFd(p);
+                    if (fd >= 0) {
+                        trackFd(fd);
+                        t_inSyscall = 0;
+                        return fd;
+                    }
+                }
+                if (guestRedirect(p, xpath, sizeof(xpath))) {
+                    a[pathIdx] = (long) (uintptr_t) xpath;
+                    translated = true;
+                }
+            }
         }
     }
-    t_inSyscall = 0;
 
-    return g_origSyscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+    if (sysInteresting(nr)) {
+        char lib[140];
+        libOf(__builtin_return_address(0), lib, sizeof(lib));
+        if (strstr(lib, "libloader") != nullptr) {
+            const char* p = origPath[0] ? origPath : nullptr;
+            char key[320];
+            if (p) snprintf(key, sizeof(key), "s%d|%.240s", (int) nr, p);
+            else   snprintf(key, sizeof(key), "s%d|%ld|%ld", (int) nr, a[0], a[1]);
+            if (firstTime(key)) {
+                g_sysSeen.fetch_add(1);
+                char b[460];
+                if (p) snprintf(b, sizeof(b), "nr=%d %.230s @%s", (int) nr, p, lib);
+                else   snprintf(b, sizeof(b), "nr=%d a0=%ld a1=%ld @%s",
+                                (int) nr, a[0], a[1], lib);
+                nlogCrit("sys", b);
+            }
+        }
+    }
+
+    long ret = g_origSyscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+
+    if (redir) {
+        if (ret >= 0) {
+            if ((nr == 56 || nr == 437) && translated) trackFd((int) ret);
+            else if (nr == 57) untrackFd((int) a[0]);
+        }
+        if (ret == 0 && (nr == 79 || nr == 80)) {
+            bool guestStat;
+            if (nr == 80) {
+                guestStat = trackedFd((int) a[0]);
+            } else {
+                const char* p = (const char*) (uintptr_t) a[1];
+                if (translated) guestStat = true;
+                else if (!p || ((a[3] & OFX_AT_EMPTY_PATH) != 0))
+                    guestStat = trackedFd((int) a[0]);
+                else guestStat = false;
+            }
+            if (guestStat) {
+                struct stat* st = (struct stat*) (uintptr_t) a[2];
+                if (st) {
+                    st->st_uid = (uid_t) g_guestUid;
+                    st->st_gid = (gid_t) g_guestUid;
+                }
+            }
+        } else if (ret == 0 && nr == 291 && translated) {
+            unsigned char* sx = (unsigned char*) (uintptr_t) a[4];
+            if (sx) {
+                uint32_t mask = 0;
+                memcpy(&mask, sx, 4);
+                mask |= 0x8u | 0x10u;
+                memcpy(sx, &mask, 4);
+                uint32_t u = (uint32_t) g_guestUid;
+                memcpy(sx + 20, &u, 4);
+                memcpy(sx + 24, &u, 4);
+            }
+        }
+    }
+
+    t_inSyscall = 0;
+    return ret;
 }
 
 void logJavaStack();
@@ -2455,7 +2628,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v62 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v63 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
