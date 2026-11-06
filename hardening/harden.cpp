@@ -468,21 +468,42 @@ void noteDl(const char* name, void* h) {
 // are not accessible there, so the lookup fails even for a library that is
 // already loaded in the default namespace.
 //
-// android_get_exported_namespace is resolved with dlsym instead of linked:
-// the CI NDK's stub library does not export it at this target API level,
-// but the symbol exists in the on-device linker (API 24+).
+// Two ways, each logged so the next log shows exactly which step failed:
+// (1) android_dlopen_ext with ANDROID_DLEXT_USE_NAMESPACE pointing at the
+// exported "default" namespace (resolved with dlsym - the CI NDK stub does
+// not export it for linking). (2) __loader_dlopen with a caller address
+// inside the linker itself, so the linker derives the default namespace
+// from that address.
 void* dlopenRtDefaultNs(const char* path, int flags) {
-    if (!origDlopenExt) return nullptr;
-    typedef android_namespace_t* (*getExportedNsFn)(const char*);
-    getExportedNsFn getNs = (getExportedNsFn)dlsym(RTLD_DEFAULT,
-                                                    "android_get_exported_namespace");
-    if (!getNs) return nullptr;
-    android_namespace_t* ns = getNs("default");
-    if (!ns) return nullptr;
-    android_dlextinfo ext{};
-    ext.flags = ANDROID_DLEXT_USE_NAMESPACE;
-    ext.library_namespace = ns;
-    return origDlopenExt(path, flags, &ext);
+    if (origDlopenExt) {
+        typedef android_namespace_t* (*getExportedNsFn)(const char*);
+        getExportedNsFn getNs = (getExportedNsFn)dlsym(RTLD_DEFAULT,
+                                                        "android_get_exported_namespace");
+        if (!getNs) {
+            nlogCrit("dl", "RT-NS dlsym=null");
+        } else {
+            android_namespace_t* ns = getNs("default");
+            if (!ns) {
+                nlogCrit("dl", "RT-NS ns=null");
+            } else {
+                android_dlextinfo ext{};
+                ext.flags = ANDROID_DLEXT_USE_NAMESPACE;
+                ext.library_namespace = ns;
+                void* h = origDlopenExt(path, flags, &ext);
+                if (h) return h;
+                nlogCrit("dl", "RT-NS ext=null");
+            }
+        }
+    }
+    typedef void* (*loaderDlopenFn)(const char*, int, const void*);
+    loaderDlopenFn loaderDlopen = (loaderDlopenFn)dlsym(RTLD_DEFAULT, "__loader_dlopen");
+    if (!loaderDlopen) {
+        nlogCrit("dl", "RT-LOADER dlsym=null");
+        return nullptr;
+    }
+    void* h = loaderDlopen(path, flags, (const void*)loaderDlopen);
+    nlogCrit("dl", h ? "RT-LOADER OK" : "RT-LOADER FAIL");
+    return h;
 }
 
 void* hookDlopen(const char* name, int flags) {
@@ -2882,7 +2903,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v55 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v56 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
