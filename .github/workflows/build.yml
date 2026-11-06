@@ -70,23 +70,6 @@ jobs:
                       "VirtualSpoof disable")
               wr(p, s)
 
-          # ---------- AppDome ART probe: let the real PM answer ----------
-          # qnxUk1.r0nZ31.vnUDn5.bAujo0.gVExy5() asks PackageManager for
-          # com.google.android.art with MATCH_APEX (0x40000000) and reads
-          # versionCode. BlackBox answers null for every package outside
-          # sSystemPackages, so the probe NPEs exactly where a real device
-          # succeeds. The host holds QUERY_ALL_PACKAGES, so the real PM can
-          # return the APEX info to the guest.
-          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/env/AppSystemEnv.java"
-          s = rd(p)
-          if "com.google.android.art" not in s:
-              s = sub(s, '        sSystemPackages.add("android");',
-                      '        sSystemPackages.add("android");\n'
-                      '        sSystemPackages.add("com.google.android.art");\n'
-                      '        sSystemPackages.add("com.android.art");',
-                      "AppSystemEnv ART")
-              wr(p, s)
-
           # ---------- NativeCore: entry point for the stealth layer ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/NativeCore.java"
           s = rd(p)
@@ -111,13 +94,7 @@ jobs:
                       "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName,\n"
                       "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
                       "                        top.niunaijun.blackbox.util.OfxLog.mode(),\n"
-                      "                        appConfig.buid);\n"
-                      "            } catch (Throwable ignored) {\n"
-                      "            }\n"
-                      "            try {\n"
-                      "                top.niunaijun.blackbox.util.OfxLog.log(\"stealth uid=\" + appConfig.buid\n"
-                      "                        + \" myuid=\" + android.os.Process.myUid()\n"
-                      "                        + \" bpid=\" + appConfig.bpid);\n"
+                      "                        android.os.Process.myUid());\n"
                       "            } catch (Throwable ignored) {\n"
                       "            }",
                       "initProcess stealth hook")
@@ -224,7 +201,6 @@ jobs:
                       "                try { top.niunaijun.blackbox.util.OfxPatch.preBindApplication(packageContext); } catch (Throwable t0) { OfxLog.log(\"preBind outer \" + t0); }\n"
                       "                application = BRLoadedApk.get(loadedApk).makeApplication(false, null);\n"
                       '                OfxLog.log("makeApplication done " + (application != null));\n'
-                      "                try { top.niunaijun.blackbox.util.OfxPatch.appCreated(); } catch (Throwable t0) { }\n"
                       "                try {\n"
                       "                    android.content.pm.ApplicationInfo ai2 = (application == null) ? null : application.getApplicationInfo();\n"
                       "                    OfxLog.log(\"id \" + (ai2 == null ? \"null\" : (\"src=\" + ai2.sourceDir + \" data=\" + ai2.dataDir + \" lib=\" + ai2.nativeLibraryDir + \" uid=\" + ai2.uid + \" myuid=\" + android.os.Process.myUid() + \" pkg=\" + ai2.packageName)));\n"
@@ -315,51 +291,10 @@ jobs:
                       "AppInstrumentation newActivity")
               wr(p, s)
 
-          # ---------- log the ART probe result ----------
-          # One line tells us whether the allowlist made the real PM answer,
-          # and with which versionCode, before the verdict window closes.
-          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/IPackageManagerProxy.java"
-          s = rd(p)
-          if "ofxArtInfo" not in s:
-              s = sub(s,
-                      "            if (AppSystemEnv.isOpenPackage(packageName)) {\n"
-                      "                return method.invoke(who, args);\n"
-                      "            }\n"
-                      "            return null;\n"
-                      "        }\n"
-                      "        \n"
-                      "        private PackageInfo createFakeGooglePlayServicesPackageInfo() {",
-                      "            if (AppSystemEnv.isOpenPackage(packageName)) {\n"
-                      "                Object ofxResult = method.invoke(who, args);\n"
-                      "                if (\"com.google.android.art\".equals(packageName)) {\n"
-                      "                    try {\n"
-                      "                        PackageInfo ofxPi = (PackageInfo) ofxResult;\n"
-                      "                        top.niunaijun.blackbox.util.OfxLog.log(\"ofxArtInfo \" + packageName\n"
-                      "                                + \" vc=\" + (ofxPi == null ? -1 : ofxPi.versionCode)\n"
-                      "                                + \" src=\" + (ofxPi == null || ofxPi.applicationInfo == null\n"
-                      "                                        ? \"null\" : ofxPi.applicationInfo.sourceDir));\n"
-                      "                    } catch (Throwable ofxT) {\n"
-                      "                        top.niunaijun.blackbox.util.OfxLog.log(\"ofxArtInfo log \" + ofxT);\n"
-                      "                    }\n"
-                      "                }\n"
-                      "                return ofxResult;\n"
-                      "            }\n"
-                      "            if (\"com.google.android.art\".equals(packageName)) {\n"
-                      "                top.niunaijun.blackbox.util.OfxLog.log(\"ofxArtInfo \" + packageName + \" -> null\");\n"
-                      "            }\n"
-                      "            return null;\n"
-                      "        }\n"
-                      "        \n"
-                      "        private PackageInfo createFakeGooglePlayServicesPackageInfo() {",
-                      "IPackageManagerProxy art result")
-              wr(p, s)
-
           # ---------- Application override for the protected guest ----------
-          # NOTE: keyed on the call, not the class name - the preBind patch
-          # above already mentions OfxPatch, which used to skip this block.
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
-          if "OfxPatch.adjust" not in s:
+          if "OfxPatch" not in s:
               s = sub(s, "import top.niunaijun.blackbox.util.OfxLog;",
                       "import top.niunaijun.blackbox.util.OfxLog;\nimport top.niunaijun.blackbox.util.OfxPatch;",
                       "BActivityThread OfxPatch import")
@@ -735,24 +670,6 @@ jobs:
                       "        top.niunaijun.blackbox.util.OfxPatch.noteCall(method.getName(), args);\n"
                       "        MethodHook methodHook = mMethodHookMap.get(method.getName());",
                       "invoke observer")
-              wr(p, s)
-
-          # ---------- scrub container paths from every proxy result ----------
-          # PackageInfo / ApplicationInfo / installed lists all carry the
-          # virtual dataDir. One post-hook covers every service method instead
-          # of patching each getter separately.
-          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/hook/ClassInvocationStub.java"
-          s = rd(p)
-          if "OfxPatch.scrubResult" not in s:
-              s = sub(s,
-                      "        result = methodHook.hook(mBase, method, args);\n"
-                      "        result = methodHook.afterHook(result);\n"
-                      "        return result;",
-                      "        result = methodHook.hook(mBase, method, args);\n"
-                      "        result = methodHook.afterHook(result);\n"
-                      "        result = top.niunaijun.blackbox.util.OfxPatch.scrubResult(result);\n"
-                      "        return result;",
-                      "invoke scrubResult")
               wr(p, s)
 
           # ---------- activity_task: block the verdict's second act ----------
