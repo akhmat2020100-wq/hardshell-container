@@ -467,14 +467,17 @@ void noteDl(const char* name, void* h) {
 // of libblackbox.so is the classloader namespace clns-9 - system libraries
 // are not accessible there, so the lookup fails even for a library that is
 // already loaded in the default namespace.
-// The CI NDK's <android/dlext.h> does not declare this (only the struct
-// and android_dlopen_ext), but the symbol exists in the linker on API 24+,
-// so declare it here. Identical redeclaration if a newer NDK adds it.
-extern "C" android_namespace_t* android_get_exported_namespace(const char* name);
-
+//
+// android_get_exported_namespace is resolved with dlsym instead of linked:
+// the CI NDK's stub library does not export it at this target API level,
+// but the symbol exists in the on-device linker (API 24+).
 void* dlopenRtDefaultNs(const char* path, int flags) {
     if (!origDlopenExt) return nullptr;
-    android_namespace_t* ns = android_get_exported_namespace("default");
+    typedef android_namespace_t* (*getExportedNsFn)(const char*);
+    getExportedNsFn getNs = (getExportedNsFn)dlsym(RTLD_DEFAULT,
+                                                    "android_get_exported_namespace");
+    if (!getNs) return nullptr;
+    android_namespace_t* ns = getNs("default");
     if (!ns) return nullptr;
     android_dlextinfo ext{};
     ext.flags = ANDROID_DLEXT_USE_NAMESPACE;
