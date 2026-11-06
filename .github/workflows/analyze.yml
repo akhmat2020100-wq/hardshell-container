@@ -18,13 +18,30 @@ jobs:
       - name: Disassemble classes7
         run: |
           java -jar baksmali.jar d analysis/classes7.dex -o out7
-          echo "=== classes containing the ART literal ==="
-          grep -rl "com.google.android.art" out7 | tee hits.txt
-          while read -r f; do
-            echo "### FILE $f"
-            cat "$f"
-          done < hits.txt
-          echo "=== all appdome-ish classes ==="
-          grep -rl "qnxUk1\|qwerty\|appdome\|AppDome" out7 | head -60
-          echo "=== all callers of getPackageInfo ==="
-          grep -rl "getPackageInfo" out7 | head -40
+          echo "=== smali count ==="
+          find out7 -name "*.smali" | wc -l
+          echo "=== top of tree ==="
+          find out7 -name "*.smali" | sort | head -120
+          echo "=== verdict toast refs ==="
+          grep -rl "Toast" out7 | head -30
+          echo "=== killProcess refs ==="
+          grep -rl "killProcess" out7 | head -30
+          echo "=== app info probes ==="
+          grep -rl "getApplicationInfo" out7 | head -30
+          echo "=== datadir probes ==="
+          grep -rl "getDataDir\|getFilesDir\|getExternalFilesDir\|getObbDir" out7 | head -30
+          echo "=== proc probes ==="
+          grep -rl "/proc/" out7 | head -30
+          echo "=== qnxUk1 tree ==="
+          find out7/qnxUk1 -name "*.smali" | sort | head -200
+          echo "=== verdict classes ==="
+          for f in $(find out7/qnxUk1 -name "*.smali" | sort); do
+            echo "### $f"
+            grep -nE "^\.class|^\.super|Toast|Virtualized|Detected|killProcess|getApplicationInfo|getPackageInfo|getDataDir|getuid|/proc/|native " "$f" | head -40
+          done
+          zip -qr appdome-smali.zip out7/qnxUk1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appdome-smali
+          path: appdome-smali.zip
