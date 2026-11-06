@@ -467,6 +467,11 @@ void noteDl(const char* name, void* h) {
 // of libblackbox.so is the classloader namespace clns-9 - system libraries
 // are not accessible there, so the lookup fails even for a library that is
 // already loaded in the default namespace.
+// The CI NDK's <android/dlext.h> does not declare this (only the struct
+// and android_dlopen_ext), but the symbol exists in the linker on API 24+,
+// so declare it here. Identical redeclaration if a newer NDK adds it.
+extern "C" android_namespace_t* android_get_exported_namespace(const char* name);
+
 void* dlopenRtDefaultNs(const char* path, int flags) {
     if (!origDlopenExt) return nullptr;
     android_namespace_t* ns = android_get_exported_namespace("default");
