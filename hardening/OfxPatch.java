@@ -454,10 +454,37 @@ public final class OfxPatch {
         } catch (Throwable t) {
             OfxLog.log("env failed " + t);
         }
+        if (probeEnabled()) {
+            try {
+                probeGms(app);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * The v46 measurements are opt-in.
+     *
+     * v46 added the GMS probe, the thread probe and an asset hook, and the
+     * guest started dying 5 ms after Activity.onCreate at a fixed instruction
+     * inside libbinder_ndk - something v45 never did. Until the backtrace in
+     * the native handler names the caller, the default build keeps v45
+     * behaviour and the probe comes back by dropping
+     * /storage/emulated/0/Download/hardbox-probe.txt
+     */
+    private static Boolean sProbe = null;
+
+    public static boolean probeEnabled() {
+        if (sProbe != null) {
+            return sProbe.booleanValue();
+        }
+        boolean on = false;
         try {
-            probeGms(app);
+            on = new java.io.File("/storage/emulated/0/Download/hardbox-probe.txt").exists();
         } catch (Throwable ignored) {
         }
+        sProbe = Boolean.valueOf(on);
+        return on;
     }
 
     /**

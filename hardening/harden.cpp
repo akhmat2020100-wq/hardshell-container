@@ -421,6 +421,14 @@ bool nmsName(const char* n) {
 // without another fifteen-minute build.
 bool g_noFirebase = false;
 
+// Every measurement added in v46 is behind a marker now. The v46 guest started
+// dying 5 ms after Activity.onCreate at a fixed instruction inside
+// libbinder_ndk, and v45 - which had none of this - did not. Until the new
+// instrumentation is proven innocent, the default build is the v45 behaviour
+// plus a real backtrace, and the probe comes back by dropping
+//   /storage/emulated/0/Download/hardbox-probe.txt
+bool g_probe = false;
+
 bool noFbName(const char* n) {
     return n && strstr(n, "FirebaseCppApp");
 }
@@ -1162,6 +1170,47 @@ void mapsScan(uintptr_t pc) {
     syscall(SYS_close, fd);
 }
 
+// ---------------------------------------------------------------------------
+// stack walk on the thread that is dying
+//
+// pc + lr answered "which instruction", not "who called it", and the lr in
+// these crashes is not even a code address. _Unwind_Backtrace walks the real
+// frame chain, and dladdr turns each pc into lib+offset without needing a
+// symbol table. This is what turns a fix-guess into a fix.
+// ---------------------------------------------------------------------------
+struct BtCtx {
+    int       n;
+    uintptr_t pc[20];
+};
+
+static _Unwind_Reason_Code btStep(struct _Unwind_Context* ctx, void* arg) {
+    BtCtx* b = (BtCtx*)arg;
+    uintptr_t p = (uintptr_t)_Unwind_GetIP(ctx);
+    if (p) b->pc[b->n++] = p;
+    return (b->n >= (int)(sizeof(b->pc) / sizeof(b->pc[0]))) ? _URC_END_OF_STACK
+                                                          : _URC_NO_REASON;
+}
+
+void dumpBacktrace() {
+    BtCtx b;
+    b.n = 0;
+    _Unwind_Backtrace(btStep, &b);
+    for (int i = 0; i < b.n; i++) {
+        Dl_info di;
+        memset(&di, 0, sizeof(di));
+        char line[320];
+        if (dladdr((void*)b.pc[i], &di) && di.dli_fname) {
+            unsigned long off = (unsigned long)(b.pc[i] - (uintptr_t)di.dli_fbase);
+            snprintf(line, sizeof(line), "#%d %s+0x%lx %s pc=%p", i,
+                     di.dli_fname, off,
+                     di.dli_sname ? di.dli_sname : "-", (void*)b.pc[i]);
+        } else {
+            snprintf(line, sizeof(line), "#%d ? pc=%p", i, (void*)b.pc[i]);
+        }
+        nlogRaw("bt", line);
+    }
+}
+
 void sigHandler(int sig, siginfo_t* si, void* uc) {
     uintptr_t pc = 0, lr = 0, sp = 0;
     ucontext_t* u = (ucontext_t*)uc;
@@ -1183,6 +1232,7 @@ void sigHandler(int sig, siginfo_t* si, void* uc) {
              sig, si ? si->si_addr : nullptr, (void*)pc, (void*)lr, (void*)sp);
     nlogRaw("CRASH", b);
     if (pc) mapsScan(pc);
+    dumpBacktrace();
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -1555,7 +1605,7 @@ void* hbThread(void*) {
             snprintf(b, sizeof(b), "hb %d", i);
             nlogRaw("alive", b);
         }
-        threadProbe();
+        if (g_probe) threadProbe();
         if ((i % 5) == 4) {
             char s[96];
             jniStrStats(s, sizeof(s));
@@ -2668,7 +2718,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v47 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v48 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
@@ -2694,14 +2744,24 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     // switches live on shared storage so a behaviour can be flipped between
     // runs without rebuilding the container
     {
-        const char* marks[] = {
+        const char* fbs[] = {
             "/storage/emulated/0/Download/hardbox-nofb.txt",
             "/storage/emulated/0/Download/HardBox/hardbox-nofb.txt",
         };
-        for (size_t i = 0; i < sizeof(marks) / sizeof(marks[0]); i++) {
-            if (access(marks[i], F_OK) == 0) { g_noFirebase = true; break; }
+        for (size_t i = 0; i < sizeof(fbs) / sizeof(fbs[0]); i++) {
+            if (access(fbs[i], F_OK) == 0) { g_noFirebase = true; break; }
         }
-        nlogCrit("switch", g_noFirebase ? "nofb=on" : "nofb=off");
+        const char* probes[] = {
+            "/storage/emulated/0/Download/hardbox-probe.txt",
+            "/storage/emulated/0/Download/HardBox/hardbox-probe.txt",
+        };
+        for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+            if (access(probes[i], F_OK) == 0) { g_probe = true; break; }
+        }
+        char sw[64];
+        snprintf(sw, sizeof(sw), "nofb=%s probe=%s",
+                 g_noFirebase ? "on" : "off", g_probe ? "on" : "off");
+        nlogCrit("switch", sw);
     }
 
     logSymbols();
