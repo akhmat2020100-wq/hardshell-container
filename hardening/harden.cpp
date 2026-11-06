@@ -624,9 +624,13 @@ void hookPthreadExit(void* retval) {
     // v50: an unwind() call inside a thread that is tearing itself down can
     // recurse into the very unwinder the loader is unloading (v47 evidence).
     // The frame-pointer walk needs no library and answers the same question.
-    uintptr_t fp;
+    uintptr_t fp = 0;
+#if defined(__aarch64__)
     __asm__ volatile("mov %0, x29" : "=r"(fp));
-    dumpFpBacktrace(fp);
+#elif defined(__arm__)
+    __asm__ volatile("mov %0, r11" : "=r"(fp));
+#endif
+    if (fp) dumpFpBacktrace(fp);
     if (origPthreadExit) origPthreadExit(retval);
 }
 
