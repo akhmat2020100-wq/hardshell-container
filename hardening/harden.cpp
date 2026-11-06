@@ -217,6 +217,63 @@ const char* libOf(void* addr, char* out, size_t cap) {
     return out;
 }
 
+// Cache libloader's mapping range once found; parsing /proc/self/maps on
+// every path syscall would stall Unity's asset loading.
+static std::atomic<uintptr_t> g_ldrLo{0};
+static std::atomic<uintptr_t> g_ldrHi{0};
+static std::atomic<long long> g_ldrNext{0};
+
+static void loaderCacheReset() {
+    g_ldrLo.store(0, std::memory_order_relaxed);
+    g_ldrHi.store(0, std::memory_order_relaxed);
+    g_ldrNext.store(0, std::memory_order_relaxed);
+}
+
+static bool loaderAddr(void* addr) {
+    uintptr_t a = (uintptr_t) addr;
+    uintptr_t l = g_ldrLo.load(std::memory_order_relaxed);
+    uintptr_t h = g_ldrHi.load(std::memory_order_relaxed);
+    if (l && a >= l && a < h) return true;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now = (long long) ts.tv_sec;
+    if (now < g_ldrNext.load(std::memory_order_relaxed)) return false;
+    g_ldrNext.store(now + 1, std::memory_order_relaxed);
+
+    // t_inSyscall is set here, so these nested syscall() calls forward to the
+    // real libc entry instead of recursing into hookSyscall.
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    std::string data;
+    char buf[8192];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) data.append(buf, (size_t)n);
+    close(fd);
+
+    uintptr_t nl = 0, nh = 0;
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t eol = data.find('\n', pos);
+        if (eol == std::string::npos) eol = data.size();
+        std::string line = data.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.find("libloader.so") == std::string::npos) continue;
+        unsigned long s = 0, e = 0, off = 0, ino = 0;
+        char perms[8] = {0}, dev[16] = {0};
+        int pathoff = 0;
+        int got = sscanf(line.c_str(), "%lx-%lx %7s %lx %15s %lu %n",
+                         &s, &e, perms, &off, dev, &ino, &pathoff);
+        if (got < 5) continue;
+        if (!nl || s < nl) nl = s;
+        if (e > nh) nh = e;
+    }
+    if (nl && nh > nl) {
+        g_ldrLo.store(nl, std::memory_order_relaxed);
+        g_ldrHi.store(nh, std::memory_order_relaxed);
+    }
+    return nl && a >= nl && a < nh;
+}
+
 void traceLib(const char* tag, const char* s, void* ret) {
     if (!s || !firstTime(s)) return;
     char lib[200];
@@ -379,19 +436,20 @@ static long hookSyscall(long nr, ...) {
         return g_origSyscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
 
     const bool redir = modeOn(M_SYSREDIR);
-    bool packer = false;
-    if (redir) {
-        char caller[140];
-        caller[0] = '\0';
-        libOf(__builtin_return_address(0), caller, sizeof(caller));
-        packer = strstr(caller, "libloader") != nullptr;
-    }
 
     // libloader reaches the kernel here, past the libc getuid/geteuid hooks.
     if (redir && (nr == 174 || nr == 175))
         return (long) g_guestUid;
 
     t_inSyscall = 1;
+
+    // Attribute the call before touching any path. loaderAddr() uses
+    // syscall(); the guard above stops that lookup recursing back into this
+    // hook (v63 crashed on the first log write because attribution ran while
+    // the guard was still clear).
+    bool packer = false;
+    if (redir && sysHasPath(nr))
+        packer = loaderAddr(__builtin_return_address(0));
 
     char origPath[768];
     origPath[0] = '\0';
@@ -593,7 +651,9 @@ void* hookDlopen(const char* name, int flags) {
         errno = ENOENT;
         return nullptr;
     }
-    return origDlopen ? origDlopen(name, flags) : nullptr;
+    void* r = origDlopen ? origDlopen(name, flags) : nullptr;
+    if (r && name && strstr(name, "libloader")) loaderCacheReset();
+    return r;
 }
 
 void* hookDlopenExt(const char* name, int flags, const void* info) {
@@ -603,7 +663,9 @@ void* hookDlopenExt(const char* name, int flags, const void* info) {
         errno = ENOENT;
         return nullptr;
     }
-    return origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
+    void* r = origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
+    if (r && name && strstr(name, "libloader")) loaderCacheReset();
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -2628,7 +2690,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v63 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v63b %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
