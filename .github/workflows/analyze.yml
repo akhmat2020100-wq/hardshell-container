@@ -1,0 +1,30 @@
+name: analyze-dex
+on:
+  workflow_dispatch:
+
+jobs:
+  dex:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          java -version
+          curl -sSL -o baksmali.jar https://github.com/baksmali/smali/releases/download/v2.5.2/baksmali-2.5.2.jar
+          ls -l baksmali.jar
+
+      - name: Disassemble classes7
+        run: |
+          java -jar baksmali.jar d analysis/classes7.dex -o out7
+          echo "=== classes containing the ART literal ==="
+          grep -rl "com.google.android.art" out7 | tee hits.txt
+          while read -r f; do
+            echo "### FILE $f"
+            cat "$f"
+          done < hits.txt
+          echo "=== all appdome-ish classes ==="
+          grep -rl "qnxUk1\|qwerty\|appdome\|AppDome" out7 | head -60
+          echo "=== all callers of getPackageInfo ==="
+          grep -rl "getPackageInfo" out7 | head -40
