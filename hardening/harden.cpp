@@ -618,8 +618,12 @@ void hookPthreadExit(void* retval) {
     snprintf(b, sizeof(b), "pthread_exit retval=%p @%s", retval,
              lib[0] ? lib : "?");
     nlogCrit("THREXIT", b);
-    BtState st = {0};
-    _Unwind_Backtrace(btCb, &st);
+    // v50: an unwind() call inside a thread that is tearing itself down can
+    // recurse into the very unwinder the loader is unloading (v47 evidence).
+    // The frame-pointer walk needs no library and answers the same question.
+    uintptr_t fp;
+    __asm__ volatile("mov %0, x29" : "=r"(fp));
+    dumpFpBacktrace(fp);
     if (origPthreadExit) origPthreadExit(retval);
 }
 
@@ -1183,13 +1187,13 @@ void mapsScan(uintptr_t pc) {
 // ends the walk - a garbage frame is a refused order, never a hang.
 // ---------------------------------------------------------------------------
 void logBtFrame(const char* tag, int n, uintptr_t pc) {
-    Dl_info di;
-    memset(&di, 0, sizeof(di));
-    char line[320];
-    if (pc && dladdr((void*)pc, &di) && di.dli_fname) {
-        unsigned long off = (unsigned long)(pc - (uintptr_t)di.dli_fbase);
-        snprintf(line, sizeof(line), "#%d %s+0x%lx pc=%p", n,
-                 di.dli_fname, off, (void*)pc);
+    // libOf reads /proc/self/maps, which answers inside a crash handler where
+    // dladdr does not resolve guest-mapped libraries
+    char lib[240];
+    libOf((void*) pc, lib, sizeof(lib));
+    char line[360];
+    if (lib[0]) {
+        snprintf(line, sizeof(line), "#%d %s pc=%p", n, lib, (void*)pc);
     } else {
         snprintf(line, sizeof(line), "#%d ?pc=%p", n, (void*)pc);
     }
@@ -2743,7 +2747,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v49 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v50 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
