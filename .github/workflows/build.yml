@@ -70,6 +70,23 @@ jobs:
                       "VirtualSpoof disable")
               wr(p, s)
 
+          # ---------- AppDome ART probe: let the real PM answer ----------
+          # qnxUk1.r0nZ31.vnUDn5.bAujo0.gVExy5() asks PackageManager for
+          # com.google.android.art with MATCH_APEX (0x40000000) and reads
+          # versionCode. BlackBox answers null for every package outside
+          # sSystemPackages, so the probe NPEs exactly where a real device
+          # succeeds. The host holds QUERY_ALL_PACKAGES, so the real PM can
+          # return the APEX info to the guest.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/env/AppSystemEnv.java"
+          s = rd(p)
+          if "com.google.android.art" not in s:
+              s = sub(s, '        sSystemPackages.add("android");',
+                      '        sSystemPackages.add("android");\n'
+                      '        sSystemPackages.add("com.google.android.art");\n'
+                      '        sSystemPackages.add("com.android.art");',
+                      "AppSystemEnv ART")
+              wr(p, s)
+
           # ---------- NativeCore: entry point for the stealth layer ----------
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/core/NativeCore.java"
           s = rd(p)
@@ -289,6 +306,45 @@ jobs:
                       "    public Activity newActivity(ClassLoader cl, String className, Intent intent) throws InstantiationException, IllegalAccessException, ClassNotFoundException {\n"
                       '        OfxLog.log("newActivity " + className);',
                       "AppInstrumentation newActivity")
+              wr(p, s)
+
+          # ---------- log the ART probe result ----------
+          # One line tells us whether the allowlist made the real PM answer,
+          # and with which versionCode, before the verdict window closes.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/IPackageManagerProxy.java"
+          s = rd(p)
+          if "ofxArtInfo" not in s:
+              s = sub(s,
+                      "            if (AppSystemEnv.isOpenPackage(packageName)) {\n"
+                      "                return method.invoke(who, args);\n"
+                      "            }\n"
+                      "            return null;\n"
+                      "        }\n"
+                      "        \n"
+                      "        private PackageInfo createFakeGooglePlayServicesPackageInfo() {",
+                      "            if (AppSystemEnv.isOpenPackage(packageName)) {\n"
+                      "                Object ofxResult = method.invoke(who, args);\n"
+                      "                if (\"com.google.android.art\".equals(packageName)) {\n"
+                      "                    try {\n"
+                      "                        PackageInfo ofxPi = (PackageInfo) ofxResult;\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.log(\"ofxArtInfo \" + packageName\n"
+                      "                                + \" vc=\" + (ofxPi == null ? -1 : ofxPi.versionCode)\n"
+                      "                                + \" src=\" + (ofxPi == null || ofxPi.applicationInfo == null\n"
+                      "                                        ? \"null\" : ofxPi.applicationInfo.sourceDir));\n"
+                      "                    } catch (Throwable ofxT) {\n"
+                      "                        top.niunaijun.blackbox.util.OfxLog.log(\"ofxArtInfo log \" + ofxT);\n"
+                      "                    }\n"
+                      "                }\n"
+                      "                return ofxResult;\n"
+                      "            }\n"
+                      "            if (\"com.google.android.art\".equals(packageName)) {\n"
+                      "                top.niunaijun.blackbox.util.OfxLog.log(\"ofxArtInfo \" + packageName + \" -> null\");\n"
+                      "            }\n"
+                      "            return null;\n"
+                      "        }\n"
+                      "        \n"
+                      "        private PackageInfo createFakeGooglePlayServicesPackageInfo() {",
+                      "IPackageManagerProxy art result")
               wr(p, s)
 
           # ---------- Application override for the protected guest ----------
