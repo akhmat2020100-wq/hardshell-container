@@ -474,6 +474,47 @@ void noteDl(const char* name, void* h) {
 // not export it for linking). (2) __loader_dlopen with a caller address
 // inside the linker itself, so the linker derives the default namespace
 // from that address.
+typedef void* (*loaderDlopenFn)(const char*, int, const void*);
+typedef void* (*loaderDlopenExtFn)(const char*, int, const void*, const void*);
+static loaderDlopenFn g_loaderDlopen = nullptr;
+static loaderDlopenExtFn g_loaderDlopenExt = nullptr;
+static bool g_loaderTried = false;
+
+void resolveLoaderFns() {
+    if (g_loaderTried) return;
+    g_loaderTried = true;
+    g_loaderDlopen = (loaderDlopenFn)dlsym(RTLD_DEFAULT, "__loader_dlopen");
+    g_loaderDlopenExt = (loaderDlopenExtFn)dlsym(RTLD_DEFAULT, "__loader_android_dlopen_ext");
+    if (!g_loaderDlopen || !g_loaderDlopenExt) nlogCrit("dl", "LOADER dlsym=null");
+}
+
+// Forward a dlopen with the ORIGINAL caller's address, so the linker
+// derives the namespace from the library that actually called dlopen - not
+// from libblackbox.so (clns-9). Without this the hook silently moves every
+// dlopen out of a default-namespace library into the classloader namespace,
+// where system libraries are not accessible; that is what broke the lazy
+// load of libandroid_runtime.so and crashed the guest. The linker falls
+// back to the default namespace when the address cannot be mapped, and a
+// NULL answer falls through to the original call, so the forward can only
+// add successes, never take them away.
+void* forwardDlopen(const char* name, int flags, const void* caller) {
+    resolveLoaderFns();
+    if (g_loaderDlopen) {
+        void* h = g_loaderDlopen(name, flags, caller);
+        if (h) return h;
+    }
+    return origDlopen ? origDlopen(name, flags) : nullptr;
+}
+
+void* forwardDlopenExt(const char* name, int flags, const void* info, const void* caller) {
+    resolveLoaderFns();
+    if (g_loaderDlopenExt) {
+        void* h = g_loaderDlopenExt(name, flags, info, caller);
+        if (h) return h;
+    }
+    return origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
+}
+
 void* dlopenRtDefaultNs(const char* path, int flags) {
     if (origDlopenExt) {
         typedef android_namespace_t* (*getExportedNsFn)(const char*);
@@ -495,18 +536,20 @@ void* dlopenRtDefaultNs(const char* path, int flags) {
             }
         }
     }
-    typedef void* (*loaderDlopenFn)(const char*, int, const void*);
-    loaderDlopenFn loaderDlopen = (loaderDlopenFn)dlsym(RTLD_DEFAULT, "__loader_dlopen");
-    if (!loaderDlopen) {
+    resolveLoaderFns();
+    if (!g_loaderDlopen) {
         nlogCrit("dl", "RT-LOADER dlsym=null");
         return nullptr;
     }
-    void* h = loaderDlopen(path, flags, (const void*)loaderDlopen);
+    void* h = g_loaderDlopen(path, flags, (const void*)g_loaderDlopen);
     nlogCrit("dl", h ? "RT-LOADER OK" : "RT-LOADER FAIL");
     return h;
 }
 
 void* hookDlopen(const char* name, int flags) {
+    // __builtin_return_address(0) is the address in the library that called
+    // dlopen - the hook is entered by branch, so LR is still the caller's.
+    const void* caller = __builtin_return_address(0);
     if (name) trace("dlopen", name);
     if (g_noFirebase && noFbName(name)) {
         nlogCrit("blocked", name);
@@ -518,14 +561,11 @@ void* hookDlopen(const char* name, int flags) {
         errno = ENOENT;
         return nullptr;
     }
-    void* r = origDlopen ? origDlopen(name, flags) : nullptr;
-    // v55: the v54 retry by absolute path failed too - the linker log says
-    // why. The dlopen is re-invoked from libblackbox.so, which lives in the
-    // classloader namespace clns-9 (only the app's own lib dirs, permitted
-    // paths /data), where /system/lib64/libandroid_runtime.so is not
-    // accessible. The library IS loaded in the default namespace (its JNI
-    // calls run fine all over the log). Load it explicitly into the default
-    // namespace instead of relying on the caller's namespace.
+    void* r = forwardDlopen(name, flags, caller);
+    if (r && name && strcmp(name, "libandroid_runtime.so") == 0) {
+        nlogCrit("dl", "RT-FWD OK");
+    }
+    // Last resort: the default-namespace retry from v55/v56.
     if (!r && name && strcmp(name, "libandroid_runtime.so") == 0) {
         r = dlopenRtDefaultNs("/system/lib64/libandroid_runtime.so", flags);
         if (!r) r = dlopenRtDefaultNs("/apex/com.android.runtime/lib64/libandroid_runtime.so", flags);
@@ -536,6 +576,7 @@ void* hookDlopen(const char* name, int flags) {
 }
 
 void* hookDlopenExt(const char* name, int flags, const void* info) {
+    const void* caller = __builtin_return_address(0);
     if (name) trace("dlopen", name);
     if (g_noFirebase && noFbName(name)) {
         nlogCrit("blocked", name);
@@ -547,8 +588,11 @@ void* hookDlopenExt(const char* name, int flags, const void* info) {
         errno = ENOENT;
         return nullptr;
     }
-    void* r = origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
-    // v55: same default-namespace retry as hookDlopen.
+    void* r = forwardDlopenExt(name, flags, info, caller);
+    if (r && name && strcmp(name, "libandroid_runtime.so") == 0) {
+        nlogCrit("dl", "RT-FWD OK");
+    }
+    // Last resort: the default-namespace retry from v55/v56.
     if (!r && name && strcmp(name, "libandroid_runtime.so") == 0) {
         r = dlopenRtDefaultNs("/system/lib64/libandroid_runtime.so", flags);
         if (!r) r = dlopenRtDefaultNs("/apex/com.android.runtime/lib64/libandroid_runtime.so", flags);
@@ -2903,7 +2947,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v56 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v57 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 

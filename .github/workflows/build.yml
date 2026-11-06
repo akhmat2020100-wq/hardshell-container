@@ -547,7 +547,25 @@ jobs:
                       "                if (ofxN < 24) ofxNames.append(pi.packageName).append(',');\n"
                       "                ofxN++;\n"
                       "            }\n"
-                      '            top.niunaijun.blackbox.util.OfxLog.log("installedPkgs n=" + ofxN + " names=" + ofxNames);\n'
+                      "            int ofxRealN = 0;\n"
+                      "            try {\n"
+                      "                Object realSlice = method.invoke(who, args);\n"
+                      "                java.util.List realList = realSlice instanceof android.content.pm.ParceledListSlice\n"
+                      "                        ? ((android.content.pm.ParceledListSlice) realSlice).getList() : null;\n"
+                      "                if (realList != null) {\n"
+                      "                    java.util.HashSet<String> ofxSeen = new java.util.HashSet<>();\n"
+                      "                    for (PackageInfo pi : ofxPkgs) ofxSeen.add(pi.packageName);\n"
+                      "                    for (Object o : realList) {\n"
+                      "                        PackageInfo pi = (PackageInfo) o;\n"
+                      "                        if (pi == null || pi.packageName == null) continue;\n"
+                      "                        if (pi.packageName.equals(BlackBoxCore.getHostPkg())) continue;\n"
+                      "                        if (!ofxSeen.add(pi.packageName)) continue;\n"
+                      "                        ofxPkgs.add(pi);\n"
+                      "                        ofxRealN++;\n"
+                      "                    }\n"
+                      "                }\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("installedPkgs n=" + ofxPkgs.size() + " real=" + ofxRealN + " names=" + ofxNames);\n'
                       "            return ParceledListSliceCompat.create(ofxPkgs);",
                       "host pkg getInstalledPackages")
 
@@ -565,7 +583,25 @@ jobs:
                       "                if (ofxAn < 24) ofxAppNames.append(ai.packageName).append(',');\n"
                       "                ofxAn++;\n"
                       "            }\n"
-                      '            top.niunaijun.blackbox.util.OfxLog.log("installedApps n=" + ofxAn + " names=" + ofxAppNames);\n'
+                      "            int ofxRealAn = 0;\n"
+                      "            try {\n"
+                      "                Object realSlice = method.invoke(who, args);\n"
+                      "                java.util.List realList = realSlice instanceof android.content.pm.ParceledListSlice\n"
+                      "                        ? ((android.content.pm.ParceledListSlice) realSlice).getList() : null;\n"
+                      "                if (realList != null) {\n"
+                      "                    java.util.HashSet<String> ofxSeen = new java.util.HashSet<>();\n"
+                      "                    for (ApplicationInfo ai : ofxApps) ofxSeen.add(ai.packageName);\n"
+                      "                    for (Object o : realList) {\n"
+                      "                        ApplicationInfo ai = (ApplicationInfo) o;\n"
+                      "                        if (ai == null || ai.packageName == null) continue;\n"
+                      "                        if (ai.packageName.equals(BlackBoxCore.getHostPkg())) continue;\n"
+                      "                        if (!ofxSeen.add(ai.packageName)) continue;\n"
+                      "                        ofxApps.add(ai);\n"
+                      "                        ofxRealAn++;\n"
+                      "                    }\n"
+                      "                }\n"
+                      "            } catch (Throwable ignored) { }\n"
+                      '            top.niunaijun.blackbox.util.OfxLog.log("installedApps n=" + ofxApps.size() + " real=" + ofxRealAn + " names=" + ofxAppNames);\n'
                       "            return ParceledListSliceCompat.create(ofxApps);",
                       "host pkg getInstalledApplications")
               wr(p, s)
