@@ -611,6 +611,9 @@ static _Unwind_Reason_Code btCb(struct _Unwind_Context* ctx, void* arg) {
 typedef void (*pthreadExitFn)(void*);
 pthreadExitFn origPthreadExit = nullptr;
 
+// forward decl: hookPthreadExit fires long before the dump below is seen
+void dumpFpBacktrace(uintptr_t fp);
+
 void hookPthreadExit(void* retval) {
     char lib[140];
     libOf(__builtin_return_address(0), lib, sizeof(lib));
