@@ -274,7 +274,7 @@ public final class OfxPatch {
             if (ai != null) {
                 ai.dataDir = real;
                 ai.deviceProtectedDataDir = real;
-                ai.credentialProtectedDataDir = real;
+                setField(ApplicationInfo.class, ai, "credentialProtectedDataDir", real);
             }
             Object impl = base;
             int guard = 0;
@@ -345,7 +345,7 @@ public final class OfxPatch {
             String real = "/data/user/0/" + pkg;
             ai.dataDir = real;
             ai.deviceProtectedDataDir = real;
-            ai.credentialProtectedDataDir = real;
+            setField(ApplicationInfo.class, ai, "credentialProtectedDataDir", real);
             if (OXIDE_PKG.equals(pkg)) {
                 OfxLog.log("scrub " + pkg + " was=" + was);
             }
