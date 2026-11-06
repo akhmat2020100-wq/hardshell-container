@@ -1216,6 +1216,9 @@ void dumpFpBacktrace(uintptr_t fp) {
         nlogRaw("fbt", "re-entrant walk skipped");
         return;
     }
+    char seed[80];
+    snprintf(seed, sizeof(seed), "fp=%p", (void*)fp);
+    nlogRaw("fbtseed", seed);
     int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem",
                           O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -1260,8 +1263,13 @@ void sigHandler(int sig, siginfo_t* si, void* uc) {
     }
 #endif
     char b[256];
-    snprintf(b, sizeof(b), "sig=%d addr=%p pc=%p lr=%p sp=%p",
-             sig, si ? si->si_addr : nullptr, (void*)pc, (void*)lr, (void*)sp);
+    snprintf(b, sizeof(b), "sig=%d addr=%p pc=%p lr=%p sp=%p x29=%p", 
+             sig, si ? si->si_addr : nullptr, (void*)pc, (void*)lr, (void*)sp,
+#if defined(__aarch64__)
+             u ? (void*)(uintptr_t)u->uc_mcontext.regs[29] : 0);
+#else
+             nullptr);
+#endif
     nlogRaw("CRASH", b);
     if (pc) mapsScan(pc);
 #if defined(__aarch64__)
@@ -2754,7 +2762,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v50 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v51 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
