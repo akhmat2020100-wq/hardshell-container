@@ -1207,6 +1207,58 @@ void logBtFrame(const char* tag, int n, uintptr_t pc) {
     nlogRaw(tag, line);
 }
 
+// A stack full of garbage looks like a walk to nowhere. The fp-walk above
+// assumed the crash thread was walking its own chain; v51 proved the chain
+// was already torn - every entry that did resolve landed in libc's raise,
+// which is our own handler's call. Scan the stack by address instead: read
+// 8 KB below sp (the frame just before the fault lives lower in memory, not
+// higher) and print every word that libOf resolves to a library the guest
+// actually loaded. The caller of libbinder_ndk+0x14bd4 is in there whether
+// or not its frame pointer survived.
+void dumpStackScan(uintptr_t sp) {
+    static std::atomic<int> g_scanIn{0};
+    if (g_scanIn.exchange(1)) {
+        nlogRaw("scan", "re-entrant skipped");
+        return;
+    }
+    char head[72];
+    snprintf(head, sizeof(head), "sp=%p", (void*)sp);
+    nlogRaw("scan", head);
+    if (!sp) {
+        g_scanIn.exchange(0);
+        return;
+    }
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem",
+                          O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        g_scanIn.exchange(0);
+        return;
+    }
+    // one page below the fault's sp, one word at a time
+    const int words = 1024;
+    for (int i = 0; i < words; i++) {
+        uintptr_t addr = (sp > (uintptr_t) 8192 ? sp - 8192 : 0) + i * 8;
+        uintptr_t val = 0;
+        long n = (long)syscall(SYS_pread64, fd, &val, sizeof(val),
+                               (off_t) addr);
+        if (n != (long)sizeof(val)) continue;
+        // a code address is usually page-aligned-ish and never tiny
+        if (val < 0x4000) continue;
+        char lib[220];
+        libOf((void*) val, lib, sizeof(lib));
+        if (!lib[0]) continue;
+        // skip our own library and the peel libc: they are the handler, not
+        // the caller. Everything else is a live suspect.
+        if (strstr(lib, "blackbox") || strstr(lib, "harden")) continue;
+        if (val == 0x73cc96a184 || val == 0x73cc95b450) continue;
+        char line[360];
+        snprintf(line, sizeof(line), "#%d %p %s", i, (void*) val, lib);
+        nlogRaw("sbt", line);
+    }
+    syscall(SYS_close, fd);
+    g_scanIn.exchange(0);
+}
+
 void dumpFpBacktrace(uintptr_t fp) {
     // a second fault arriving while the walk is running must not recurse:
     // the handler is not async-signal-safe against itself, one guard flag
@@ -1274,8 +1326,10 @@ void sigHandler(int sig, siginfo_t* si, void* uc) {
     if (pc) mapsScan(pc);
 #if defined(__aarch64__)
     if (u) dumpFpBacktrace((uintptr_t)u->uc_mcontext.regs[29]);
+    if (u) dumpStackScan(sp);
 #elif defined(__arm__)
     if (u) dumpFpBacktrace((uintptr_t)u->uc_mcontext.arm_fp);
+    if (u) dumpStackScan(sp);
 #endif
     signal(sig, SIG_DFL);
     raise(sig);
@@ -2762,7 +2816,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v51 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v52 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
