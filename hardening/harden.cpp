@@ -430,13 +430,16 @@ std::atomic<int> g_dlFail{0};
 // A dlopen that never returns and a dlopen that returns null look identical in
 // a trace that only prints the name. Print the answer for the libraries the
 // guest's engine actually needs, and for every failure.
+//
+// Note: never call dlerror() here. dlerror() is a one-shot queue - reading it
+// clears it, so the caller that lost the library would later get nullptr where
+// it expected a message. That is a null dereference planted inside ART.
 void noteDl(const char* name, void* h) {
     if (!h) {
         int n = g_dlFail.fetch_add(1);
         if (name && n < 300) {
-            const char* e = dlerror();
             char b[420];
-            snprintf(b, sizeof(b), "FAIL %s err=%s", name, e ? e : "-");
+            snprintf(b, sizeof(b), "FAIL %s", name);
             nlogCrit("dl", b);
         }
         return;
@@ -462,7 +465,6 @@ void* hookDlopen(const char* name, int flags) {
         errno = ENOENT;
         return nullptr;
     }
-    dlerror();
     void* r = origDlopen ? origDlopen(name, flags) : nullptr;
     noteDl(name, r);
     return r;
@@ -480,7 +482,6 @@ void* hookDlopenExt(const char* name, int flags, const void* info) {
         errno = ENOENT;
         return nullptr;
     }
-    dlerror();
     void* r = origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
     noteDl(name, r);
     return r;
@@ -1108,28 +1109,57 @@ int hookSigqueue(pid_t pid, int sig, const union sigval val) {
 
 // ---------------------------------------------------------------------------
 // crash handler: sig + faulting pc + the maps line that owns it
+//
+// v46 used a 64 KB static buffer and a single read(), which is enough for a
+// toy process and nowhere near enough for this one - the guest maps a 900 MB
+// APK, three Unity data packs and every framework library, so the read came
+// back truncated and the faulting pc resolved to nothing. Stream the file in
+// 4 KB chunks instead and parse line by line; no size limit, no BSS bloat, and
+// the range prefix survives truncation of an absurdly long pathname.
 // ---------------------------------------------------------------------------
-char g_maps[65536];
-
 void mapsScan(uintptr_t pc) {
     int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
-    ssize_t n = (ssize_t)syscall(SYS_read, fd, g_maps, sizeof(g_maps) - 1);
-    syscall(SYS_close, fd);
-    if (n <= 0) return;
-    g_maps[n] = '\0';
 
-    char* p = g_maps;
-    while (p && *p) {
-        char* nl = strchr(p, '\n');
+    char buf[4096];
+    char line[512];
+    size_t len = 0;
+    bool truncated = false;
+
+    auto flush = [&]() {
+        if (len == 0) return true;
+        line[len] = '\0';
         unsigned long a = 0, b = 0;
-        if (sscanf(p, "%lx-%lx", &a, &b) == 2 && pc >= a && pc < b) {
-            nlogRaw("crashmap", p);
-            return;
+        if (sscanf(line, "%lx-%lx", &a, &b) == 2 && pc >= a && pc < b) {
+            nlogRaw("crashmap", line);
+            return false;
         }
-        if (!nl) break;
-        p = nl + 1;
+        return true;
+    };
+
+    bool keepGoing = true;
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_read, fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n && keepGoing; i++) {
+            char c = buf[i];
+            if (c == '\n') {
+                keepGoing = flush();
+                len = 0;
+                truncated = false;
+            } else if (!truncated) {
+                if (len < sizeof(line) - 1) {
+                    line[len++] = c;
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+        if (!keepGoing) break;
     }
+    if (keepGoing) flush();
+
+    syscall(SYS_close, fd);
 }
 
 void sigHandler(int sig, siginfo_t* si, void* uc) {
@@ -1502,44 +1532,16 @@ static void threadProbe() {
 }
 
 // ---------------------------------------------------------------------------
-// AAssetManager: Unity's scene data never crosses libc.
+// AAssetManager is deliberately NOT hooked here.
 //
-// The engine reads assets through an AAssetManager bound to the APK at boot,
-// so not one open/openat from libunity ever reaches the file hooks - the trace
-// looks empty even while the game is loading a scene. Hooking the NDK door
-// shows the reads, and a stream of MISS answers from it is the hang itself.
+// It looked like the obvious door - Unity reads scene data through it and no
+// open() ever reaches libc - but an inline hook on a libandroid.so entry point
+// is a patch on the one library every AssetManager call in the process goes
+// through. v46 put one there and the guest started dying in a loop 60 ms after
+// Activity.onCreate, at a fixed pc, before a single asset was ever asked for.
+// The measurement is not worth a crash: it comes back only if it can be done
+// by patching the guest's own PLT instead of a system library's code.
 // ---------------------------------------------------------------------------
-typedef void* (*aassetOpenFn)(void*, const char*, int);
-typedef void* (*aassetDirFn)(void*, const char*);
-aassetOpenFn origAssetOpen = nullptr;
-aassetDirFn  origAssetOpenDir = nullptr;
-std::atomic<long> g_assetCalls{0};
-std::atomic<int>  g_assetFail{0};
-std::atomic<int>  g_assetLog{0};
-
-void* hookAssetOpen(void* mgr, const char* name, int mode) {
-    void* r = origAssetOpen ? origAssetOpen(mgr, name, mode) : nullptr;
-    g_assetCalls.fetch_add(1);
-    if (!r) g_assetFail.fetch_add(1);
-    int n = g_assetLog.fetch_add(1);
-    if (name && (n < 900 || (!r && n < 1400))) {
-        char b[420];
-        snprintf(b, sizeof(b), "%s -> %p%s", name, r, r ? "" : "  MISS");
-        nlogRaw("asset", b);
-    }
-    return r;
-}
-
-void* hookAssetOpenDir(void* mgr, const char* name) {
-    void* r = origAssetOpenDir ? origAssetOpenDir(mgr, name) : nullptr;
-    g_assetCalls.fetch_add(1);
-    if (name) {
-        char b[420];
-        snprintf(b, sizeof(b), "dir %s -> %p%s", name, r, r ? "" : "  MISS");
-        nlogRaw("asset", b);
-    }
-    return r;
-}
 
 // ---------------------------------------------------------------------------
 // heartbeat: proves when the process stopped breathing
@@ -1557,8 +1559,7 @@ void* hbThread(void*) {
         if ((i % 5) == 4) {
             char s[96];
             jniStrStats(s, sizeof(s));
-            snprintf(b, sizeof(b), "%s assets=%ld miss=%d",
-                     s, g_assetCalls.load(), g_assetFail.load());
+            snprintf(b, sizeof(b), "%s", s);
             nlogCrit("jni", b);
         }
         struct timespec ts;
@@ -2667,7 +2668,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "%s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v47 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
@@ -2715,12 +2716,9 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         nlogRaw("skip", "liblog mirror");
     }
 
-    // The guest's scene data lives behind AAssetManager and never reaches the
-    // libc file hooks; this is the only door that sees it.
-    patchLib("libandroid.so", "AAssetManager_open",    (void*)hookAssetOpen,
-             (void**)&origAssetOpen, "AAssetManager_open");
-    patchLib("libandroid.so", "AAssetManager_openDir", (void*)hookAssetOpenDir,
-             (void**)&origAssetOpenDir, "AAssetManager_openDir");
+    // No AAssetManager hooks. See the note above hbThread - an inline patch on
+    // libandroid.so killed v46 before its first asset call.
+    nlogRaw("skip", "asset hooks (libandroid untouched)");
 
     if (modeOn(M_UID)) {
         patch("getuid",  (void*)hookGetuid,  (void**)&origGetuid,  "getuid");

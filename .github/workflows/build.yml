@@ -570,6 +570,30 @@ jobs:
                       "host pkg getInstalledApplications")
               wr(p, s)
 
+          # ---------- vending: stop manufacturing a Play Store that isn't there ----------
+          # BPackageManagerService answers getPackageInfo("com.android.vending")
+          # with a hand-built PackageInfo - version 33.8.16-21, sourceDir null,
+          # nativeLibraryDir null - while com.google.android.gms, gsf and
+          # com.google.android.gms.ads all raise NameNotFoundException. That
+          # combination does not exist on any real phone: the Play Store cannot be
+          # installed without Play services, and a Store stripped of its APK path
+          # is the container announcing itself in one structure. The v46 probe read
+          # exactly this back out of the guest. Drop the return so vending reports
+          # absent like the rest of Google: a phone with no Google account is
+          # ordinary, a half-installed Play Store is a fingerprint.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/service/IPackageManagerProxy.java"
+          s = rd(p)
+          if "ofxVending" not in s:
+              s = sub(s,
+                      '            if ("com.android.vending".equals(packageName)) {\n'
+                      "                return createFakeGooglePlayServicesPackageInfo();\n"
+                      "            }",
+                      '            if ("com.android.vending".equals(packageName)) {\n'
+                      '                top.niunaijun.blackbox.util.OfxLog.log("ofxVending passthrough");\n'
+                      "            }",
+                      "vending fake removal")
+              wr(p, s)
+
           # ---------- toast provenance: who puts the verdict on screen ----------
           # The SDK's final act is a Toast. It crosses INotificationManager on its
           # way to the window manager, so the caller stack here either names the
