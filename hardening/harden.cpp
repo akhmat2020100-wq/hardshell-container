@@ -2848,10 +2848,8 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
             arStage = 2;
         }
         if (arStage) {
-            const char* e = dlerror();
             char b[200];
-            snprintf(b, sizeof(b), "AndroidRuntime::exit stage=%d err=%s",
-                     arStage, e ? e : "-");
+            snprintf(b, sizeof(b), "AndroidRuntime::exit stage=%d", arStage);
             nlogCrit("miss", b);
         }
 
@@ -2870,10 +2868,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
                 nlogRaw("miss", "JVM_Halt");
             }
         } else {
-            const char* e = dlerror();
-            char b[240];
-            snprintf(b, sizeof(b), "libopenjdkjvm err=%s", e ? e : "-");
-            nlogCrit("miss", b);
+            nlogCrit("miss", "libopenjdkjvm err=dlopen failed");
         }
     } else {
         nlogRaw("skip", "exit group");
