@@ -1150,7 +1150,7 @@ void mapsScan(uintptr_t pc) {
         line[len] = '\0';
         unsigned long a = 0, b = 0;
         if (sscanf(line, "%lx-%lx", &a, &b) == 2 && pc >= a && pc < b) {
-            nlogRaw("crashmap", line);
+            nlogCrit("crashmap", line);
             return false;
         }
         return true;
@@ -1204,26 +1204,31 @@ void logBtFrame(const char* tag, int n, uintptr_t pc) {
     } else {
         snprintf(line, sizeof(line), "#%d ?pc=%p", n, (void*)pc);
     }
-    nlogRaw(tag, line);
+    nlogCrit(tag, line);
 }
 
 // A stack full of garbage looks like a walk to nowhere. The fp-walk above
 // assumed the crash thread was walking its own chain; v51 proved the chain
 // was already torn - every entry that did resolve landed in libc's raise,
 // which is our own handler's call. Scan the stack by address instead: read
-// 8 KB below sp (the frame just before the fault lives lower in memory, not
-// higher) and print every word that libOf resolves to a library the guest
-// actually loaded. The caller of libbinder_ndk+0x14bd4 is in there whether
-// or not its frame pointer survived.
+// 8 KB above sp and print every word that libOf resolves to a library the
+// guest actually loaded. The caller of libbinder_ndk+0x14bd4 is in there
+// whether or not its frame pointer survived.
+//
+// v52 scanned BELOW sp and would have found nothing: on arm64 the stack
+// grows down, so the caller's frame - saved return addresses included -
+// lives at HIGHER addresses than the faulting sp. The v51 crashes prove
+// it: x29 == sp there, and the word at [sp+8] held lr, i.e. live frame
+// data sits at sp and above, not below it.
 void dumpStackScan(uintptr_t sp) {
     static std::atomic<int> g_scanIn{0};
     if (g_scanIn.exchange(1)) {
-        nlogRaw("scan", "re-entrant skipped");
+        nlogCrit("scan", "re-entrant skipped");
         return;
     }
     char head[72];
     snprintf(head, sizeof(head), "sp=%p", (void*)sp);
-    nlogRaw("scan", head);
+    nlogCrit("scan", head);
     if (!sp) {
         g_scanIn.exchange(0);
         return;
@@ -1234,10 +1239,12 @@ void dumpStackScan(uintptr_t sp) {
         g_scanIn.exchange(0);
         return;
     }
-    // one page below the fault's sp, one word at a time
+    // one page above the fault's sp, one word at a time: the caller frames
+    // are above sp on arm64 (see comment above). pread64 past the top of
+    // the stack mapping just returns short and is skipped.
     const int words = 1024;
     for (int i = 0; i < words; i++) {
-        uintptr_t addr = (sp > (uintptr_t) 8192 ? sp - 8192 : 0) + i * 8;
+        uintptr_t addr = sp + (uintptr_t)i * 8;
         uintptr_t val = 0;
         long n = (long)syscall(SYS_pread64, fd, &val, sizeof(val),
                                (off_t) addr);
@@ -1253,7 +1260,7 @@ void dumpStackScan(uintptr_t sp) {
         if (val == 0x73cc96a184 || val == 0x73cc95b450) continue;
         char line[360];
         snprintf(line, sizeof(line), "#%d %p %s", i, (void*) val, lib);
-        nlogRaw("sbt", line);
+        nlogCrit("sbt", line);
     }
     syscall(SYS_close, fd);
     g_scanIn.exchange(0);
@@ -1265,12 +1272,12 @@ void dumpFpBacktrace(uintptr_t fp) {
     // makes a re-entrant call a one-line log instead of a nested death
     static std::atomic<int> g_btIn{0};
     if (g_btIn.exchange(1)) {
-        nlogRaw("fbt", "re-entrant walk skipped");
+        nlogCrit("fbt", "re-entrant walk skipped");
         return;
     }
     char seed[80];
     snprintf(seed, sizeof(seed), "fp=%p", (void*)fp);
-    nlogRaw("fbtseed", seed);
+    nlogCrit("fbtseed", seed);
     int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem",
                           O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -1278,7 +1285,7 @@ void dumpFpBacktrace(uintptr_t fp) {
         return;
     }
     if (!fp) {
-        nlogRaw("fbt", "no frame pointer in context");
+        nlogCrit("fbt", "no frame pointer in context");
     }
     for (int i = 0; fp && i < 28; i++) {
         uintptr_t dp[2] = {0, 0};
@@ -1314,15 +1321,32 @@ void sigHandler(int sig, siginfo_t* si, void* uc) {
         sp = (uintptr_t)u->uc_mcontext.arm_sp;
     }
 #endif
-    char b[256];
-    snprintf(b, sizeof(b), "sig=%d addr=%p pc=%p lr=%p sp=%p x29=%p", 
+    char b[512];
+    int n = snprintf(b, sizeof(b), "sig=%d addr=%p pc=%p lr=%p sp=%p x29=%p",
              sig, si ? si->si_addr : nullptr, (void*)pc, (void*)lr, (void*)sp,
 #if defined(__aarch64__)
              u ? (void*)(uintptr_t)u->uc_mcontext.regs[29] : 0);
 #else
              nullptr);
 #endif
-    nlogRaw("CRASH", b);
+#if defined(__aarch64__)
+    // The faulting call's arguments. x0 is the null object the libbinder_ndk
+    // instruction dereferenced (addr=0x8 means x0 itself was 0); x1-x7 may
+    // still name what the call was for.
+    if (u && n > 0 && (size_t)n < sizeof(b)) {
+        snprintf(b + n, sizeof(b) - (size_t)n,
+                 " x0=%p x1=%p x2=%p x3=%p x4=%p x5=%p x6=%p x7=%p",
+                 (void*)(uintptr_t)u->uc_mcontext.regs[0],
+                 (void*)(uintptr_t)u->uc_mcontext.regs[1],
+                 (void*)(uintptr_t)u->uc_mcontext.regs[2],
+                 (void*)(uintptr_t)u->uc_mcontext.regs[3],
+                 (void*)(uintptr_t)u->uc_mcontext.regs[4],
+                 (void*)(uintptr_t)u->uc_mcontext.regs[5],
+                 (void*)(uintptr_t)u->uc_mcontext.regs[6],
+                 (void*)(uintptr_t)u->uc_mcontext.regs[7]);
+    }
+#endif
+    nlogCrit("CRASH", b);
     if (pc) mapsScan(pc);
 #if defined(__aarch64__)
     if (u) dumpFpBacktrace((uintptr_t)u->uc_mcontext.regs[29]);
@@ -2816,7 +2840,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v52 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v53 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
