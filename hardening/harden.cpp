@@ -2947,7 +2947,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v57 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v58 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
@@ -3016,11 +3016,25 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         nlogRaw("skip", "uid mask");
     }
 
-    if (modeOn(M_NMS) || modeOn(M_DLTRACE)) {
+    // dlopen is only intercepted when a name actually has to be refused.
+    // Patching it for tracing (M_DLTRACE) is what killed the guest: every
+    // forwarded call re-enters the linker from libblackbox.so, so the linker
+    // derives the namespace from THIS library (clns-9, /data only) instead of
+    // the caller that asked - libloader.so in clns-10. System libraries then
+    // stop resolving for the guest: the last v57 log shows
+    //   dl FAIL libstatssocket.so
+    //   dl FAIL libandroid_runtime.so
+    // and the very next instruction null-derefs inside libbinder_ndk
+    // (addr=0x8, x0=0) because the lazy runtime handle it expected is NULL.
+    // Passing the original caller through __loader_dlopen would be correct,
+    // but the linker does not export it into clns-9, so it cannot be resolved
+    // from here. Until that is solved properly, tracing stays off the hot path:
+    // M_NMS alone arms the hooks, M_DLTRACE does nothing.
+    if (modeOn(M_NMS)) {
         patch("dlopen",             (void*)hookDlopen,    (void**)&origDlopen,    "dlopen");
         patch("android_dlopen_ext", (void*)hookDlopenExt, (void**)&origDlopenExt, "dlopenext");
     } else {
-        nlogRaw("skip", "dlopen group");
+        nlogRaw("skip", "dlopen group (caller-namespace would be lost)");
     }
 
     if (modeOn(M_KILLTRACE) || modeOn(M_NOKILL)) {
