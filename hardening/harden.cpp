@@ -474,6 +474,26 @@ void* hookDlopen(const char* name, int flags) {
         return nullptr;
     }
     void* r = origDlopen ? origDlopen(name, flags) : nullptr;
+    // v54: libbinder_ndk lazily dlopens "libandroid_runtime.so" to resolve
+    // the Java-binder interop (ibinderForJavaObject etc.). In the guest
+    // that lookup returns NULL - 250 of 250 crashing runs had it, 0 of 250
+    // without it, and the two runs where it succeeded are the only runs
+    // that ever reached Unity. With the handle NULL the lazy loader leaves
+    // its function pointers NULL, ibinderForJavaObject returns a null
+    // binder, and the graphics-init path dereferences it inside
+    // libbinder_ndk (+0x14bd4, ldr x0,[x0,#8], addr=0x8). The name lookup
+    // fails in the guest's namespace; the file itself is a normal
+    // world-readable APEX library, so retry by absolute path before
+    // handing the caller the NULL.
+    if (!r && name && strcmp(name, "libandroid_runtime.so") == 0 && origDlopen) {
+        r = origDlopen("/apex/com.android.runtime/lib64/libandroid_runtime.so", flags);
+        if (r) {
+            nlogCrit("dl", "RT-RETRY OK apex");
+        } else {
+            r = origDlopen("/system/lib64/libandroid_runtime.so", flags);
+            nlogCrit("dl", r ? "RT-RETRY OK system" : "RT-RETRY FAIL");
+        }
+    }
     noteDl(name, r);
     return r;
 }
@@ -491,6 +511,16 @@ void* hookDlopenExt(const char* name, int flags, const void* info) {
         return nullptr;
     }
     void* r = origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
+    // v54: same retry as hookDlopen - the lazy loader may reach us here.
+    if (!r && name && strcmp(name, "libandroid_runtime.so") == 0 && origDlopenExt) {
+        r = origDlopenExt("/apex/com.android.runtime/lib64/libandroid_runtime.so", flags, info);
+        if (r) {
+            nlogCrit("dl", "RT-RETRY OK apex");
+        } else {
+            r = origDlopenExt("/system/lib64/libandroid_runtime.so", flags, info);
+            nlogCrit("dl", r ? "RT-RETRY OK system" : "RT-RETRY FAIL");
+        }
+    }
     noteDl(name, r);
     return r;
 }
@@ -2840,7 +2870,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v53 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v54 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
