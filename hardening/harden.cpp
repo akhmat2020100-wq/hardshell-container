@@ -1173,42 +1173,63 @@ void mapsScan(uintptr_t pc) {
 // ---------------------------------------------------------------------------
 // stack walk on the thread that is dying
 //
-// pc + lr answered "which instruction", not "who called it", and the lr in
-// these crashes is not even a code address. _Unwind_Backtrace walks the real
-// frame chain, and dladdr turns each pc into lib+offset without needing a
-// symbol table. This is what turns a fix-guess into a fix.
+// _Unwind_Backtrace returned zero frames inside the v48 guest: the lazy
+// libunwind the walk needs is not in the guest's linker namespace, so the log
+// stayed at "pc + silence". This walks the frame-pointer chain instead. Every
+// arm64 frame compiled with frame pointers saves {x29, x30} as a pair at
+// [fp], so from the crashing context's x29 the whole chain is (next_fp,
+// caller_pc) pairs that pread64 from /proc/self/mem answers without any
+// unwinder library. A null, backwards, oversized or misaligned link simply
+// ends the walk - a garbage frame is a refused order, never a hang.
 // ---------------------------------------------------------------------------
-struct BtCtx {
-    int       n;
-    uintptr_t pc[20];
-};
-
-static _Unwind_Reason_Code btStep(struct _Unwind_Context* ctx, void* arg) {
-    BtCtx* b = (BtCtx*)arg;
-    uintptr_t p = (uintptr_t)_Unwind_GetIP(ctx);
-    if (p) b->pc[b->n++] = p;
-    return (b->n >= (int)(sizeof(b->pc) / sizeof(b->pc[0]))) ? _URC_END_OF_STACK
-                                                          : _URC_NO_REASON;
+void logBtFrame(const char* tag, int n, uintptr_t pc) {
+    Dl_info di;
+    memset(&di, 0, sizeof(di));
+    char line[320];
+    if (pc && dladdr((void*)pc, &di) && di.dli_fname) {
+        unsigned long off = (unsigned long)(pc - (uintptr_t)di.dli_fbase);
+        snprintf(line, sizeof(line), "#%d %s+0x%lx pc=%p", n,
+                 di.dli_fname, off, (void*)pc);
+    } else {
+        snprintf(line, sizeof(line), "#%d ?pc=%p", n, (void*)pc);
+    }
+    nlogRaw(tag, line);
 }
 
-void dumpBacktrace() {
-    BtCtx b;
-    b.n = 0;
-    _Unwind_Backtrace(btStep, &b);
-    for (int i = 0; i < b.n; i++) {
-        Dl_info di;
-        memset(&di, 0, sizeof(di));
-        char line[320];
-        if (dladdr((void*)b.pc[i], &di) && di.dli_fname) {
-            unsigned long off = (unsigned long)(b.pc[i] - (uintptr_t)di.dli_fbase);
-            snprintf(line, sizeof(line), "#%d %s+0x%lx %s pc=%p", i,
-                     di.dli_fname, off,
-                     di.dli_sname ? di.dli_sname : "-", (void*)b.pc[i]);
-        } else {
-            snprintf(line, sizeof(line), "#%d ? pc=%p", i, (void*)b.pc[i]);
-        }
-        nlogRaw("bt", line);
+void dumpFpBacktrace(uintptr_t fp) {
+    // a second fault arriving while the walk is running must not recurse:
+    // the handler is not async-signal-safe against itself, one guard flag
+    // makes a re-entrant call a one-line log instead of a nested death
+    static std::atomic<int> g_btIn{0};
+    if (g_btIn.exchange(1)) {
+        nlogRaw("fbt", "re-entrant walk skipped");
+        return;
     }
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem",
+                          O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        g_btIn.exchange(0);
+        return;
+    }
+    if (!fp) {
+        nlogRaw("fbt", "no frame pointer in context");
+    }
+    for (int i = 0; fp && i < 28; i++) {
+        uintptr_t dp[2] = {0, 0};
+        long n = (long)syscall(SYS_pread64, fd, dp, sizeof(dp), (off_t)fp);
+        if (n < (long)sizeof(dp)) break;
+        uintptr_t savedFp = dp[0];
+        uintptr_t caller  = dp[1];
+        if (caller) logBtFrame("fbt", i, caller);
+        // stop the chain the moment it stops looking like a chain
+        if (!savedFp) break;
+        if (savedFp <= fp) break;
+        if ((savedFp - fp) > 0x100000) break;
+        if (savedFp % 8) break;
+        fp = savedFp;
+    }
+    syscall(SYS_close, fd);
+    g_btIn.exchange(0);
 }
 
 void sigHandler(int sig, siginfo_t* si, void* uc) {
@@ -1232,7 +1253,11 @@ void sigHandler(int sig, siginfo_t* si, void* uc) {
              sig, si ? si->si_addr : nullptr, (void*)pc, (void*)lr, (void*)sp);
     nlogRaw("CRASH", b);
     if (pc) mapsScan(pc);
-    dumpBacktrace();
+#if defined(__aarch64__)
+    if (u) dumpFpBacktrace((uintptr_t)u->uc_mcontext.regs[29]);
+#elif defined(__arm__)
+    if (u) dumpFpBacktrace((uintptr_t)u->uc_mcontext.arm_fp);
+#endif
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -2718,7 +2743,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v48 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v49 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
