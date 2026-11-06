@@ -47,7 +47,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dlfcn.h>
-#include <android/dlext.h>
 #include <cerrno>
 #include <cstring>
 #include <cstdint>
@@ -414,192 +413,24 @@ bool nmsName(const char* n) {
     return strstr(n, "libnms.so") || strstr(n, "libpglarmor.so");
 }
 
-// Experiment switch, read once at boot from shared storage:
-//   /storage/emulated/0/Download/hardbox-nofb.txt
-// With the marker present, libFirebaseCppApp is denied at dlopen. If the engine
-// is waiting on a Firebase call, the P/Invoke now throws instead of hanging and
-// the game either handles it or falls over - both answers are worth having
-// without another fifteen-minute build.
-bool g_noFirebase = false;
-
-// Every measurement added in v46 is behind a marker now. The v46 guest started
-// dying 5 ms after Activity.onCreate at a fixed instruction inside
-// libbinder_ndk, and v45 - which had none of this - did not. Until the new
-// instrumentation is proven innocent, the default build is the v45 behaviour
-// plus a real backtrace, and the probe comes back by dropping
-//   /storage/emulated/0/Download/hardbox-probe.txt
-bool g_probe = false;
-
-bool noFbName(const char* n) {
-    return n && strstr(n, "FirebaseCppApp");
-}
-
-std::atomic<int> g_dlFail{0};
-
-// A dlopen that never returns and a dlopen that returns null look identical in
-// a trace that only prints the name. Print the answer for the libraries the
-// guest's engine actually needs, and for every failure.
-//
-// Note: never call dlerror() here. dlerror() is a one-shot queue - reading it
-// clears it, so the caller that lost the library would later get nullptr where
-// it expected a message. That is a null dereference planted inside ART.
-void noteDl(const char* name, void* h) {
-    if (!h) {
-        int n = g_dlFail.fetch_add(1);
-        if (name && n < 300) {
-            char b[420];
-            snprintf(b, sizeof(b), "FAIL %s", name);
-            nlogCrit("dl", b);
-        }
-        return;
-    }
-    if (name && (strstr(name, "Firebase") || strstr(name, "libunity") ||
-                 strstr(name, "libil2cpp") || strstr(name, "libmain") ||
-                 strstr(name, "libloader"))) {
-        char b[420];
-        snprintf(b, sizeof(b), "OK %s h=%p", name, h);
-        nlogCrit("dl", b);
-    }
-}
-
-// Load a library explicitly into the linker's default namespace. A plain
-// dlopen() resolves in the caller's namespace, which for code running out
-// of libblackbox.so is the classloader namespace clns-9 - system libraries
-// are not accessible there, so the lookup fails even for a library that is
-// already loaded in the default namespace.
-//
-// Two ways, each logged so the next log shows exactly which step failed:
-// (1) android_dlopen_ext with ANDROID_DLEXT_USE_NAMESPACE pointing at the
-// exported "default" namespace (resolved with dlsym - the CI NDK stub does
-// not export it for linking). (2) __loader_dlopen with a caller address
-// inside the linker itself, so the linker derives the default namespace
-// from that address.
-typedef void* (*loaderDlopenFn)(const char*, int, const void*);
-typedef void* (*loaderDlopenExtFn)(const char*, int, const void*, const void*);
-static loaderDlopenFn g_loaderDlopen = nullptr;
-static loaderDlopenExtFn g_loaderDlopenExt = nullptr;
-static bool g_loaderTried = false;
-
-void resolveLoaderFns() {
-    if (g_loaderTried) return;
-    g_loaderTried = true;
-    g_loaderDlopen = (loaderDlopenFn)dlsym(RTLD_DEFAULT, "__loader_dlopen");
-    g_loaderDlopenExt = (loaderDlopenExtFn)dlsym(RTLD_DEFAULT, "__loader_android_dlopen_ext");
-    if (!g_loaderDlopen || !g_loaderDlopenExt) nlogCrit("dl", "LOADER dlsym=null");
-}
-
-// Forward a dlopen with the ORIGINAL caller's address, so the linker
-// derives the namespace from the library that actually called dlopen - not
-// from libblackbox.so (clns-9). Without this the hook silently moves every
-// dlopen out of a default-namespace library into the classloader namespace,
-// where system libraries are not accessible; that is what broke the lazy
-// load of libandroid_runtime.so and crashed the guest. The linker falls
-// back to the default namespace when the address cannot be mapped, and a
-// NULL answer falls through to the original call, so the forward can only
-// add successes, never take them away.
-void* forwardDlopen(const char* name, int flags, const void* caller) {
-    resolveLoaderFns();
-    if (g_loaderDlopen) {
-        void* h = g_loaderDlopen(name, flags, caller);
-        if (h) return h;
+void* hookDlopen(const char* name, int flags) {
+    if (name) trace("dlopen", name);
+    if (modeOn(M_NMS) && nmsName(name)) {
+        nlogRaw("blocked", name);
+        errno = ENOENT;
+        return nullptr;
     }
     return origDlopen ? origDlopen(name, flags) : nullptr;
 }
 
-void* forwardDlopenExt(const char* name, int flags, const void* info, const void* caller) {
-    resolveLoaderFns();
-    if (g_loaderDlopenExt) {
-        void* h = g_loaderDlopenExt(name, flags, info, caller);
-        if (h) return h;
+void* hookDlopenExt(const char* name, int flags, const void* info) {
+    if (name) trace("dlopen", name);
+    if (modeOn(M_NMS) && nmsName(name)) {
+        nlogRaw("blocked", name);
+        errno = ENOENT;
+        return nullptr;
     }
     return origDlopenExt ? origDlopenExt(name, flags, info) : nullptr;
-}
-
-void* dlopenRtDefaultNs(const char* path, int flags) {
-    if (origDlopenExt) {
-        typedef android_namespace_t* (*getExportedNsFn)(const char*);
-        getExportedNsFn getNs = (getExportedNsFn)dlsym(RTLD_DEFAULT,
-                                                        "android_get_exported_namespace");
-        if (!getNs) {
-            nlogCrit("dl", "RT-NS dlsym=null");
-        } else {
-            android_namespace_t* ns = getNs("default");
-            if (!ns) {
-                nlogCrit("dl", "RT-NS ns=null");
-            } else {
-                android_dlextinfo ext{};
-                ext.flags = ANDROID_DLEXT_USE_NAMESPACE;
-                ext.library_namespace = ns;
-                void* h = origDlopenExt(path, flags, &ext);
-                if (h) return h;
-                nlogCrit("dl", "RT-NS ext=null");
-            }
-        }
-    }
-    resolveLoaderFns();
-    if (!g_loaderDlopen) {
-        nlogCrit("dl", "RT-LOADER dlsym=null");
-        return nullptr;
-    }
-    void* h = g_loaderDlopen(path, flags, (const void*)g_loaderDlopen);
-    nlogCrit("dl", h ? "RT-LOADER OK" : "RT-LOADER FAIL");
-    return h;
-}
-
-void* hookDlopen(const char* name, int flags) {
-    // __builtin_return_address(0) is the address in the library that called
-    // dlopen - the hook is entered by branch, so LR is still the caller's.
-    const void* caller = __builtin_return_address(0);
-    if (name) trace("dlopen", name);
-    if (g_noFirebase && noFbName(name)) {
-        nlogCrit("blocked", name);
-        errno = ENOENT;
-        return nullptr;
-    }
-    if (modeOn(M_NMS) && nmsName(name)) {
-        nlogRaw("blocked", name);
-        errno = ENOENT;
-        return nullptr;
-    }
-    void* r = forwardDlopen(name, flags, caller);
-    if (r && name && strcmp(name, "libandroid_runtime.so") == 0) {
-        nlogCrit("dl", "RT-FWD OK");
-    }
-    // Last resort: the default-namespace retry from v55/v56.
-    if (!r && name && strcmp(name, "libandroid_runtime.so") == 0) {
-        r = dlopenRtDefaultNs("/system/lib64/libandroid_runtime.so", flags);
-        if (!r) r = dlopenRtDefaultNs("/apex/com.android.runtime/lib64/libandroid_runtime.so", flags);
-        nlogCrit("dl", r ? "RT-RETRY OK default-ns" : "RT-RETRY FAIL default-ns");
-    }
-    noteDl(name, r);
-    return r;
-}
-
-void* hookDlopenExt(const char* name, int flags, const void* info) {
-    const void* caller = __builtin_return_address(0);
-    if (name) trace("dlopen", name);
-    if (g_noFirebase && noFbName(name)) {
-        nlogCrit("blocked", name);
-        errno = ENOENT;
-        return nullptr;
-    }
-    if (modeOn(M_NMS) && nmsName(name)) {
-        nlogRaw("blocked", name);
-        errno = ENOENT;
-        return nullptr;
-    }
-    void* r = forwardDlopenExt(name, flags, info, caller);
-    if (r && name && strcmp(name, "libandroid_runtime.so") == 0) {
-        nlogCrit("dl", "RT-FWD OK");
-    }
-    // Last resort: the default-namespace retry from v55/v56.
-    if (!r && name && strcmp(name, "libandroid_runtime.so") == 0) {
-        r = dlopenRtDefaultNs("/system/lib64/libandroid_runtime.so", flags);
-        if (!r) r = dlopenRtDefaultNs("/apex/com.android.runtime/lib64/libandroid_runtime.so", flags);
-        nlogCrit("dl", r ? "RT-RETRY OK default-ns" : "RT-RETRY FAIL default-ns");
-    }
-    noteDl(name, r);
-    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -718,9 +549,6 @@ static _Unwind_Reason_Code btCb(struct _Unwind_Context* ctx, void* arg) {
 typedef void (*pthreadExitFn)(void*);
 pthreadExitFn origPthreadExit = nullptr;
 
-// forward decl: hookPthreadExit fires long before the dump below is seen
-void dumpFpBacktrace(uintptr_t fp);
-
 void hookPthreadExit(void* retval) {
     char lib[140];
     libOf(__builtin_return_address(0), lib, sizeof(lib));
@@ -728,16 +556,8 @@ void hookPthreadExit(void* retval) {
     snprintf(b, sizeof(b), "pthread_exit retval=%p @%s", retval,
              lib[0] ? lib : "?");
     nlogCrit("THREXIT", b);
-    // v50: an unwind() call inside a thread that is tearing itself down can
-    // recurse into the very unwinder the loader is unloading (v47 evidence).
-    // The frame-pointer walk needs no library and answers the same question.
-    uintptr_t fp = 0;
-#if defined(__aarch64__)
-    __asm__ volatile("mov %0, x29" : "=r"(fp));
-#elif defined(__arm__)
-    __asm__ volatile("mov %0, r11" : "=r"(fp));
-#endif
-    if (fp) dumpFpBacktrace(fp);
+    BtState st = {0};
+    _Unwind_Backtrace(btCb, &st);
     if (origPthreadExit) origPthreadExit(retval);
 }
 
@@ -1235,181 +1055,28 @@ int hookSigqueue(pid_t pid, int sig, const union sigval val) {
 
 // ---------------------------------------------------------------------------
 // crash handler: sig + faulting pc + the maps line that owns it
-//
-// v46 used a 64 KB static buffer and a single read(), which is enough for a
-// toy process and nowhere near enough for this one - the guest maps a 900 MB
-// APK, three Unity data packs and every framework library, so the read came
-// back truncated and the faulting pc resolved to nothing. Stream the file in
-// 4 KB chunks instead and parse line by line; no size limit, no BSS bloat, and
-// the range prefix survives truncation of an absurdly long pathname.
 // ---------------------------------------------------------------------------
+char g_maps[65536];
+
 void mapsScan(uintptr_t pc) {
     int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
+    ssize_t n = (ssize_t)syscall(SYS_read, fd, g_maps, sizeof(g_maps) - 1);
+    syscall(SYS_close, fd);
+    if (n <= 0) return;
+    g_maps[n] = '\0';
 
-    char buf[4096];
-    char line[512];
-    size_t len = 0;
-    bool truncated = false;
-
-    auto flush = [&]() {
-        if (len == 0) return true;
-        line[len] = '\0';
+    char* p = g_maps;
+    while (p && *p) {
+        char* nl = strchr(p, '\n');
         unsigned long a = 0, b = 0;
-        if (sscanf(line, "%lx-%lx", &a, &b) == 2 && pc >= a && pc < b) {
-            nlogCrit("crashmap", line);
-            return false;
+        if (sscanf(p, "%lx-%lx", &a, &b) == 2 && pc >= a && pc < b) {
+            nlogRaw("crashmap", p);
+            return;
         }
-        return true;
-    };
-
-    bool keepGoing = true;
-    for (;;) {
-        ssize_t n = (ssize_t)syscall(SYS_read, fd, buf, sizeof(buf));
-        if (n <= 0) break;
-        for (ssize_t i = 0; i < n && keepGoing; i++) {
-            char c = buf[i];
-            if (c == '\n') {
-                keepGoing = flush();
-                len = 0;
-                truncated = false;
-            } else if (!truncated) {
-                if (len < sizeof(line) - 1) {
-                    line[len++] = c;
-                } else {
-                    truncated = true;
-                }
-            }
-        }
-        if (!keepGoing) break;
+        if (!nl) break;
+        p = nl + 1;
     }
-    if (keepGoing) flush();
-
-    syscall(SYS_close, fd);
-}
-
-// ---------------------------------------------------------------------------
-// stack walk on the thread that is dying
-//
-// _Unwind_Backtrace returned zero frames inside the v48 guest: the lazy
-// libunwind the walk needs is not in the guest's linker namespace, so the log
-// stayed at "pc + silence". This walks the frame-pointer chain instead. Every
-// arm64 frame compiled with frame pointers saves {x29, x30} as a pair at
-// [fp], so from the crashing context's x29 the whole chain is (next_fp,
-// caller_pc) pairs that pread64 from /proc/self/mem answers without any
-// unwinder library. A null, backwards, oversized or misaligned link simply
-// ends the walk - a garbage frame is a refused order, never a hang.
-// ---------------------------------------------------------------------------
-void logBtFrame(const char* tag, int n, uintptr_t pc) {
-    // libOf reads /proc/self/maps, which answers inside a crash handler where
-    // dladdr does not resolve guest-mapped libraries
-    char lib[240];
-    libOf((void*) pc, lib, sizeof(lib));
-    char line[360];
-    if (lib[0]) {
-        snprintf(line, sizeof(line), "#%d %s pc=%p", n, lib, (void*)pc);
-    } else {
-        snprintf(line, sizeof(line), "#%d ?pc=%p", n, (void*)pc);
-    }
-    nlogCrit(tag, line);
-}
-
-// A stack full of garbage looks like a walk to nowhere. The fp-walk above
-// assumed the crash thread was walking its own chain; v51 proved the chain
-// was already torn - every entry that did resolve landed in libc's raise,
-// which is our own handler's call. Scan the stack by address instead: read
-// 8 KB above sp and print every word that libOf resolves to a library the
-// guest actually loaded. The caller of libbinder_ndk+0x14bd4 is in there
-// whether or not its frame pointer survived.
-//
-// v52 scanned BELOW sp and would have found nothing: on arm64 the stack
-// grows down, so the caller's frame - saved return addresses included -
-// lives at HIGHER addresses than the faulting sp. The v51 crashes prove
-// it: x29 == sp there, and the word at [sp+8] held lr, i.e. live frame
-// data sits at sp and above, not below it.
-void dumpStackScan(uintptr_t sp) {
-    static std::atomic<int> g_scanIn{0};
-    if (g_scanIn.exchange(1)) {
-        nlogCrit("scan", "re-entrant skipped");
-        return;
-    }
-    char head[72];
-    snprintf(head, sizeof(head), "sp=%p", (void*)sp);
-    nlogCrit("scan", head);
-    if (!sp) {
-        g_scanIn.exchange(0);
-        return;
-    }
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem",
-                          O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        g_scanIn.exchange(0);
-        return;
-    }
-    // one page above the fault's sp, one word at a time: the caller frames
-    // are above sp on arm64 (see comment above). pread64 past the top of
-    // the stack mapping just returns short and is skipped.
-    const int words = 1024;
-    for (int i = 0; i < words; i++) {
-        uintptr_t addr = sp + (uintptr_t)i * 8;
-        uintptr_t val = 0;
-        long n = (long)syscall(SYS_pread64, fd, &val, sizeof(val),
-                               (off_t) addr);
-        if (n != (long)sizeof(val)) continue;
-        // a code address is usually page-aligned-ish and never tiny
-        if (val < 0x4000) continue;
-        char lib[220];
-        libOf((void*) val, lib, sizeof(lib));
-        if (!lib[0]) continue;
-        // skip our own library and the peel libc: they are the handler, not
-        // the caller. Everything else is a live suspect.
-        if (strstr(lib, "blackbox") || strstr(lib, "harden")) continue;
-        if (val == 0x73cc96a184 || val == 0x73cc95b450) continue;
-        char line[360];
-        snprintf(line, sizeof(line), "#%d %p %s", i, (void*) val, lib);
-        nlogCrit("sbt", line);
-    }
-    syscall(SYS_close, fd);
-    g_scanIn.exchange(0);
-}
-
-void dumpFpBacktrace(uintptr_t fp) {
-    // a second fault arriving while the walk is running must not recurse:
-    // the handler is not async-signal-safe against itself, one guard flag
-    // makes a re-entrant call a one-line log instead of a nested death
-    static std::atomic<int> g_btIn{0};
-    if (g_btIn.exchange(1)) {
-        nlogCrit("fbt", "re-entrant walk skipped");
-        return;
-    }
-    char seed[80];
-    snprintf(seed, sizeof(seed), "fp=%p", (void*)fp);
-    nlogCrit("fbtseed", seed);
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem",
-                          O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        g_btIn.exchange(0);
-        return;
-    }
-    if (!fp) {
-        nlogCrit("fbt", "no frame pointer in context");
-    }
-    for (int i = 0; fp && i < 28; i++) {
-        uintptr_t dp[2] = {0, 0};
-        long n = (long)syscall(SYS_pread64, fd, dp, sizeof(dp), (off_t)fp);
-        if (n < (long)sizeof(dp)) break;
-        uintptr_t savedFp = dp[0];
-        uintptr_t caller  = dp[1];
-        if (caller) logBtFrame("fbt", i, caller);
-        // stop the chain the moment it stops looking like a chain
-        if (!savedFp) break;
-        if (savedFp <= fp) break;
-        if ((savedFp - fp) > 0x100000) break;
-        if (savedFp % 8) break;
-        fp = savedFp;
-    }
-    syscall(SYS_close, fd);
-    g_btIn.exchange(0);
 }
 
 void sigHandler(int sig, siginfo_t* si, void* uc) {
@@ -1428,40 +1095,11 @@ void sigHandler(int sig, siginfo_t* si, void* uc) {
         sp = (uintptr_t)u->uc_mcontext.arm_sp;
     }
 #endif
-    char b[512];
-    int n = snprintf(b, sizeof(b), "sig=%d addr=%p pc=%p lr=%p sp=%p x29=%p",
-             sig, si ? si->si_addr : nullptr, (void*)pc, (void*)lr, (void*)sp,
-#if defined(__aarch64__)
-             u ? (void*)(uintptr_t)u->uc_mcontext.regs[29] : 0);
-#else
-             nullptr);
-#endif
-#if defined(__aarch64__)
-    // The faulting call's arguments. x0 is the null object the libbinder_ndk
-    // instruction dereferenced (addr=0x8 means x0 itself was 0); x1-x7 may
-    // still name what the call was for.
-    if (u && n > 0 && (size_t)n < sizeof(b)) {
-        snprintf(b + n, sizeof(b) - (size_t)n,
-                 " x0=%p x1=%p x2=%p x3=%p x4=%p x5=%p x6=%p x7=%p",
-                 (void*)(uintptr_t)u->uc_mcontext.regs[0],
-                 (void*)(uintptr_t)u->uc_mcontext.regs[1],
-                 (void*)(uintptr_t)u->uc_mcontext.regs[2],
-                 (void*)(uintptr_t)u->uc_mcontext.regs[3],
-                 (void*)(uintptr_t)u->uc_mcontext.regs[4],
-                 (void*)(uintptr_t)u->uc_mcontext.regs[5],
-                 (void*)(uintptr_t)u->uc_mcontext.regs[6],
-                 (void*)(uintptr_t)u->uc_mcontext.regs[7]);
-    }
-#endif
-    nlogCrit("CRASH", b);
+    char b[256];
+    snprintf(b, sizeof(b), "sig=%d addr=%p pc=%p lr=%p sp=%p",
+             sig, si ? si->si_addr : nullptr, (void*)pc, (void*)lr, (void*)sp);
+    nlogRaw("CRASH", b);
     if (pc) mapsScan(pc);
-#if defined(__aarch64__)
-    if (u) dumpFpBacktrace((uintptr_t)u->uc_mcontext.regs[29]);
-    if (u) dumpStackScan(sp);
-#elif defined(__arm__)
-    if (u) dumpFpBacktrace((uintptr_t)u->uc_mcontext.arm_fp);
-    if (u) dumpStackScan(sp);
-#endif
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -1667,179 +1305,19 @@ int installSeccomp() {
 }
 
 // ---------------------------------------------------------------------------
-// thread probe: a hang has a shape, and two numbers give it away.
-//
-// cpu  - ticks burned between beats. A player loop waiting on a socket spends
-//        nothing; a retry spin owns a whole core; a deadlock spends nothing and
-//        still never finishes, which is why cpu alone is not enough.
-// sys  - the kernel's own answer for what the thread is sitting in. futex with
-//        a shared address across two threads names a deadlock; ppoll with a
-//        timeout names a poll loop; running names a spin.
-//
-// Read through raw syscalls so the file hooks cannot re-enter themselves.
-// ---------------------------------------------------------------------------
-struct ThrSlot {
-    int  tid;
-    long ticks;
-};
-static ThrSlot g_thr[256];
-static int g_thrUsed = 0;
-
-static int rawOpenRO(const char* path) {
-    return (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
-}
-
-static int rawReadFd(int fd, char* buf, int cap) {
-    if (cap <= 1) return 0;
-    long n = syscall(SYS_read, fd, buf, (size_t)(cap - 1));
-    if (n < 0) n = 0;
-    buf[n] = '\0';
-    return (int)n;
-}
-
-static bool probeWanted(const char* comm) {
-    if (!comm[0]) return false;
-    if (strstr(comm, "Unity")) return true;
-    if (strstr(comm, "RenderThread")) return true;
-    if (strstr(comm, "Job.Worker")) return true;
-    if (strstr(comm, "ofx")) return false;
-    if (strcmp(comm, "main") == 0) return true;
-    return false;
-}
-
-static void probeOne(int tid) {
-    char p[112];
-    char comm[64] = {0};
-
-    snprintf(p, sizeof(p), "/proc/self/task/%d/comm", tid);
-    int fd = rawOpenRO(p);
-    if (fd < 0) return;
-    rawReadFd(fd, comm, sizeof(comm));
-    syscall(SYS_close, fd);
-    char* nl = strchr(comm, '\n');
-    if (nl) *nl = '\0';
-    if (!comm[0]) snprintf(comm, sizeof(comm), "?");
-
-    long utime = 0, stime = 0;
-    char st = '?';
-    snprintf(p, sizeof(p), "/proc/self/task/%d/stat", tid);
-    fd = rawOpenRO(p);
-    if (fd >= 0) {
-        char sb[1024];
-        int got = rawReadFd(fd, sb, sizeof(sb));
-        syscall(SYS_close, fd);
-        if (got > 0) {
-            char* rp = strrchr(sb, ')');
-            if (rp && rp[1] == ' ') {
-                sscanf(rp + 2,
-                       "%c %*d %*d %*d %*d %*d %*lu %*lu %*lu %*lu %*lu %lu %lu",
-                       &st, &utime, &stime);
-            }
-        }
-    }
-
-    long ticks = utime + stime;
-    long delta = -1;
-    int i = 0;
-    for (; i < g_thrUsed; i++) {
-        if (g_thr[i].tid == tid) {
-            delta = ticks - g_thr[i].ticks;
-            g_thr[i].ticks = ticks;
-            break;
-        }
-    }
-    if (i == g_thrUsed) {
-        if (g_thrUsed < 256) {
-            g_thr[g_thrUsed].tid = tid;
-            g_thr[g_thrUsed].ticks = ticks;
-            g_thrUsed++;
-        }
-    }
-
-    // 100 jiffies per second on Android: 150 ticks over a 2 s beat is 75% of a core.
-    bool hot = delta >= 150;
-    bool watched = probeWanted(comm);
-    if (!hot && !watched) return;
-
-    char sc[120] = "?";
-    snprintf(p, sizeof(p), "/proc/self/task/%d/syscall", tid);
-    fd = rawOpenRO(p);
-    if (fd >= 0) {
-        char sb[200];
-        rawReadFd(fd, sb, sizeof(sb));
-        syscall(SYS_close, fd);
-        char* e = strchr(sb, '\n');
-        if (e) *e = '\0';
-        sb[110] = '\0';
-        snprintf(sc, sizeof(sc), "%s", sb[0] ? sb : "?");
-    }
-
-    char line[320];
-    snprintf(line, sizeof(line), "THR id=%d name=%s st=%c cpu=%ldtck sys=%s",
-             tid, comm, st, delta, sc);
-    nlogCrit("probe", line);
-}
-
-struct ProbeDent {
-    uint64_t       d_ino;
-    int64_t        d_off;
-    unsigned short d_reclen;
-    unsigned char  d_type;
-    char           d_name[320];
-};
-
-static void threadProbe() {
-    int dfd = rawOpenRO("/proc/self/task");
-    if (dfd < 0) return;
-    for (;;) {
-        char db[4096];
-        long n = syscall(SYS_getdents64, dfd, db, sizeof(db));
-        if (n <= 0) break;
-        for (long off = 0; off + 20 <= n; ) {
-            ProbeDent* d = (ProbeDent*)(db + off);
-            if (d->d_reclen < 20 || off + (long)d->d_reclen > n) break;
-            off += d->d_reclen;
-            if (d->d_name[0] < '0' || d->d_name[0] > '9') continue;
-            probeOne(atoi(d->d_name));
-        }
-    }
-    syscall(SYS_close, dfd);
-
-    char b[48];
-    snprintf(b, sizeof(b), "threads=%d", g_thrUsed);
-    nlogCrit("probe", b);
-}
-
-// ---------------------------------------------------------------------------
-// AAssetManager is deliberately NOT hooked here.
-//
-// It looked like the obvious door - Unity reads scene data through it and no
-// open() ever reaches libc - but an inline hook on a libandroid.so entry point
-// is a patch on the one library every AssetManager call in the process goes
-// through. v46 put one there and the guest started dying in a loop 60 ms after
-// Activity.onCreate, at a fixed pc, before a single asset was ever asked for.
-// The measurement is not worth a crash: it comes back only if it can be done
-// by patching the guest's own PLT instead of a system library's code.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // heartbeat: proves when the process stopped breathing
 // ---------------------------------------------------------------------------
 static void jniStrStats(char* out, size_t cap);
 
 void* hbThread(void*) {
-    for (int i = 0; i < 300 && !g_hbStop.load(); i++) {
-        char b[160];
-        if ((i % 5) == 0) {
-            snprintf(b, sizeof(b), "hb %d", i);
-            nlogRaw("alive", b);
-        }
-        if (g_probe) threadProbe();
+    for (int i = 0; i < 90 && !g_hbStop.load(); i++) {
+        char b[32];
+        snprintf(b, sizeof(b), "hb %d", i);
+        nlogRaw("alive", b);
         if ((i % 5) == 4) {
             char s[96];
             jniStrStats(s, sizeof(s));
-            snprintf(b, sizeof(b), "%s", s);
-            nlogCrit("jni", b);
+            nlogCrit("jni", s);
         }
         struct timespec ts;
         ts.tv_sec = 2;
@@ -2370,26 +1848,6 @@ void patch(const char* name, void* replace, void** orig, const char* tag) {
     void* target = sym(name);
     if (!target) { nlogRaw("miss", name); return; }
     if (DobbyHook(target, replace, orig) != 0) { nlogRaw("fail", name); return; }
-    nlogRaw("hook", tag ? tag : name);
-}
-
-// NDK entry points live in libandroid.so and are not in the default lookup
-// scope of a guest process, so they need the handle.
-void patchLib(const char* lib, const char* name, void* replace, void** orig,
-              const char* tag) {
-    void* target = symLib(lib, name);
-    if (!target) {
-        char b[160];
-        snprintf(b, sizeof(b), "miss %s@%s", name, lib);
-        nlogRaw("patch", b);
-        return;
-    }
-    if (DobbyHook(target, replace, orig) != 0) {
-        char b[160];
-        snprintf(b, sizeof(b), "fail %s@%s", name, lib);
-        nlogRaw("patch", b);
-        return;
-    }
     nlogRaw("hook", tag ? tag : name);
 }
 
@@ -2947,7 +2405,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v58 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v59 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
@@ -2970,29 +2428,6 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         return;
     }
 
-    // switches live on shared storage so a behaviour can be flipped between
-    // runs without rebuilding the container
-    {
-        const char* fbs[] = {
-            "/storage/emulated/0/Download/hardbox-nofb.txt",
-            "/storage/emulated/0/Download/HardBox/hardbox-nofb.txt",
-        };
-        for (size_t i = 0; i < sizeof(fbs) / sizeof(fbs[0]); i++) {
-            if (access(fbs[i], F_OK) == 0) { g_noFirebase = true; break; }
-        }
-        const char* probes[] = {
-            "/storage/emulated/0/Download/hardbox-probe.txt",
-            "/storage/emulated/0/Download/HardBox/hardbox-probe.txt",
-        };
-        for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
-            if (access(probes[i], F_OK) == 0) { g_probe = true; break; }
-        }
-        char sw[64];
-        snprintf(sw, sizeof(sw), "nofb=%s probe=%s",
-                 g_noFirebase ? "on" : "off", g_probe ? "on" : "off");
-        nlogCrit("switch", sw);
-    }
-
     logSymbols();
 
     // liblog mirror goes in before anything else: the first anti-cheat log
@@ -3005,10 +2440,6 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         nlogRaw("skip", "liblog mirror");
     }
 
-    // No AAssetManager hooks. See the note above hbThread - an inline patch on
-    // libandroid.so killed v46 before its first asset call.
-    nlogRaw("skip", "asset hooks (libandroid untouched)");
-
     if (modeOn(M_UID)) {
         patch("getuid",  (void*)hookGetuid,  (void**)&origGetuid,  "getuid");
         patch("geteuid", (void*)hookGeteuid, (void**)&origGeteuid, "geteuid");
@@ -3016,25 +2447,11 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
         nlogRaw("skip", "uid mask");
     }
 
-    // dlopen is only intercepted when a name actually has to be refused.
-    // Patching it for tracing (M_DLTRACE) is what killed the guest: every
-    // forwarded call re-enters the linker from libblackbox.so, so the linker
-    // derives the namespace from THIS library (clns-9, /data only) instead of
-    // the caller that asked - libloader.so in clns-10. System libraries then
-    // stop resolving for the guest: the last v57 log shows
-    //   dl FAIL libstatssocket.so
-    //   dl FAIL libandroid_runtime.so
-    // and the very next instruction null-derefs inside libbinder_ndk
-    // (addr=0x8, x0=0) because the lazy runtime handle it expected is NULL.
-    // Passing the original caller through __loader_dlopen would be correct,
-    // but the linker does not export it into clns-9, so it cannot be resolved
-    // from here. Until that is solved properly, tracing stays off the hot path:
-    // M_NMS alone arms the hooks, M_DLTRACE does nothing.
-    if (modeOn(M_NMS)) {
+    if (modeOn(M_NMS) || modeOn(M_DLTRACE)) {
         patch("dlopen",             (void*)hookDlopen,    (void**)&origDlopen,    "dlopen");
         patch("android_dlopen_ext", (void*)hookDlopenExt, (void**)&origDlopenExt, "dlopenext");
     } else {
-        nlogRaw("skip", "dlopen group (caller-namespace would be lost)");
+        nlogRaw("skip", "dlopen group");
     }
 
     if (modeOn(M_KILLTRACE) || modeOn(M_NOKILL)) {
@@ -3066,8 +2483,10 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
             arStage = 2;
         }
         if (arStage) {
+            const char* e = dlerror();
             char b[200];
-            snprintf(b, sizeof(b), "AndroidRuntime::exit stage=%d", arStage);
+            snprintf(b, sizeof(b), "AndroidRuntime::exit stage=%d err=%s",
+                     arStage, e ? e : "-");
             nlogCrit("miss", b);
         }
 
@@ -3086,7 +2505,10 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
                 nlogRaw("miss", "JVM_Halt");
             }
         } else {
-            nlogCrit("miss", "libopenjdkjvm err=dlopen failed");
+            const char* e = dlerror();
+            char b[240];
+            snprintf(b, sizeof(b), "libopenjdkjvm err=%s", e ? e : "-");
+            nlogCrit("miss", b);
         }
     } else {
         nlogRaw("skip", "exit group");
