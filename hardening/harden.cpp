@@ -2184,10 +2184,38 @@ static bool packerCaller(void* ret) {
            strstr(lib, "libfusion") != nullptr;
 }
 
-// Class names only. Paths are left alone in this build: a rewritten dataDir
-// that libloader later opens would fail for a reason that is not the check.
+// Class names only here. Paths are masked separately below: a rewritten
+// dataDir that the caller then opens only works because IOCore already
+// redirects /data/user/<n>/<pkg> back to the real directory.
 static bool maskable(const char* s) {
     return s && strncmp(s, "top.niunaijun", 13) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Path mask. The guest's data directory is
+//   /data/user/0/top.niunaijun.blackbox/blackbox/data/user/<n>/<pkg>
+// and it reaches native code as a plain Java String: ApplicationInfo.dataDir,
+// filesDir, cacheDir, getDataDir(). The string by itself names the container,
+// and it is the one fingerprint the proc-file scrub cannot reach.
+//
+// Masked to /data/user/<n>/<pkg>, which is what a real install reports. If the
+// caller then opens that path, IOCore's redirect table already maps it to the
+// real directory (built in enableRedirect from the untouched dataDir), so the
+// open lands on the same files - the lie lives only in the string.
+static bool containerPath(const char* s) {
+    return s && s[0] == '/' && strstr(s, "/blackbox/data/user/") != nullptr;
+}
+
+static const char* maskPathCopy(const char* s) {
+    static const char* kVirtual = "/blackbox/data/user/";
+    const char* k = strstr(s, kVirtual);
+    if (!k) return s;
+    std::string out = "/data/user/";
+    out += (k + strlen(kVirtual));
+    char* m = (char*) malloc(out.size() + 1);
+    if (!m) return s;
+    memcpy(m, out.c_str(), out.size() + 1);
+    return m;
 }
 
 struct MaskRule {
@@ -2265,6 +2293,21 @@ static const char* JNICALL hookGetStrUtf(JNIEnv* env, jstring js, jboolean* isCo
     if (!r) return nullptr;
     void* ret = __builtin_return_address(0);
     noteIdentity("GetStringUTFChars", r, ret);
+    if (containerPath(r) && packerCaller(ret)) {
+        const char* m = maskPathCopy(r);
+        if (m != r) {
+            trackMasked(m);
+            int n = g_maskHits.fetch_add(1);
+            if (n < 80) {
+                char lib[200];
+                libOf(ret, lib, sizeof(lib));
+                char b[560];
+                snprintf(b, sizeof(b), "maskpath %.200s -> %.200s @%s", r, m, lib);
+                nlogCrit("mask", b);
+            }
+            return m;
+        }
+    }
     if (maskable(r) && packerCaller(ret)) {
         const char* m = maskCopy(r);
         if (m != r) {
@@ -2405,7 +2448,7 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v59 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v60 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
