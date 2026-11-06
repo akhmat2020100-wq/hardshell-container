@@ -100,6 +100,7 @@ public final class OfxPatch {
         homeEnabled();
         keepAlive();
         blockedClass(null);
+        scrub(info);
         String mode = modeName();
         OfxLog.log("appMode=" + mode + " src=" + cachedSource + " pkg=" + packageName
                 + " proc=" + processName + " manifestClass=" + info.className);
@@ -249,6 +250,164 @@ public final class OfxPatch {
     }
 
     /**
+     * The post-onCreate sanitizer above is too late for a packer that reads
+     * its own paths while Application.onCreate is still running. Run the same
+     * rewrite on the package Context between `enableRedirect` and
+     * `makeApplication`: IOCore has already recorded the virtual target, so
+     * every file access to the real-looking path is still redirected into the
+     * container, but the guest only ever sees the path a normal install has.
+     */
+    public static void sanitizeEarly(android.content.Context base) {
+        if (base == null) {
+            return;
+        }
+        if (!homeEnabled()) {
+            return;
+        }
+        try {
+            String pkg = base.getPackageName();
+            if (pkg == null) {
+                return;
+            }
+            String real = "/data/user/0/" + pkg;
+            ApplicationInfo ai = base.getApplicationInfo();
+            if (ai != null) {
+                ai.dataDir = real;
+                ai.deviceProtectedDataDir = real;
+                ai.credentialProtectedDataDir = real;
+            }
+            Object impl = base;
+            int guard = 0;
+            while (impl instanceof android.content.ContextWrapper && guard++ < 16) {
+                android.content.Context b =
+                        ((android.content.ContextWrapper) impl).getBaseContext();
+                if (b == null || b == impl) {
+                    break;
+                }
+                impl = b;
+            }
+            Object loadedApk = null;
+            try {
+                loadedApk = black.android.app.BRContextImpl.get(impl).mPackageInfo();
+            } catch (Throwable ignored) {
+            }
+            if (loadedApk != null) {
+                setField(loadedApk.getClass(), loadedApk, "mDataDirFile", new File(real));
+                setField(loadedApk.getClass(), loadedApk, "mCredentialProtectedDataDirFile", new File(real));
+                setField(loadedApk.getClass(), loadedApk, "mDeviceProtectedDataDirFile", new File(real));
+            }
+            Class<?> c = impl.getClass();
+            while (c != null && !"android.app.ContextImpl".equals(c.getName())) {
+                c = c.getSuperclass();
+            }
+            if (c != null) {
+                String[] caches = {"mFilesDir", "mCacheDir", "mNoBackupFilesDir",
+                        "mCodeCacheDir", "mPreferencesDir"};
+                for (String f : caches) {
+                    setField(c, impl, f, null);
+                }
+            }
+            OfxLog.log("home early -> " + real
+                    + " ai=" + (ai != null)
+                    + " loadedApk=" + (loadedApk != null)
+                    + " dataDir=" + base.getDataDir()
+                    + " ext=" + earlyPath(base, 0)
+                    + " obb=" + earlyPath(base, 1)
+                    + " sdcard=" + Environment.getExternalStorageDirectory());
+        } catch (Throwable t) {
+            OfxLog.log("home early failed " + t);
+        }
+    }
+
+    /**
+     * The virtual PM builds every ApplicationInfo with the container path in
+     * dataDir. A packer that walks getInstalledPackages() - or asks for its
+     * own PackageInfo - reads "blackbox" straight out of that field. Rewrite
+     * the three path fields to the layout a normal install has. IOCore already
+     * owns the redirect for these names, so file access is unaffected.
+     */
+    public static void scrub(ApplicationInfo ai) {
+        if (ai == null || !homeEnabled()) {
+            return;
+        }
+        try {
+            String pkg = ai.packageName;
+            if (pkg == null) {
+                return;
+            }
+            String was = ai.dataDir;
+            // Only the guest objects built by the virtual PM carry a container
+            // path. System packages already report their real dataDir and must
+            // never be rewritten, even if the host package name matches.
+            if (was == null || !was.contains("/blackbox/")) {
+                return;
+            }
+            String real = "/data/user/0/" + pkg;
+            ai.dataDir = real;
+            ai.deviceProtectedDataDir = real;
+            ai.credentialProtectedDataDir = real;
+            if (OXIDE_PKG.equals(pkg)) {
+                OfxLog.log("scrub " + pkg + " was=" + was);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static String earlyPath(android.content.Context base, int kind) {
+        try {
+            if (kind == 0) {
+                return String.valueOf(base.getExternalFilesDir(null));
+            }
+            return String.valueOf(base.getObbDir());
+        } catch (Throwable t) {
+            return "err:" + t;
+        }
+    }
+
+    /**
+     * Single choke point behind every proxied system-service call. Mutate any
+     * ApplicationInfo the guest is about to receive, in place, so the virtual
+     * paths never cross the Java boundary. ParceledListSlice is unwrapped by
+     * reflection because its getList() is the only public view of the items.
+     */
+    public static Object scrubResult(Object result) {
+        if (result == null || !homeEnabled()) {
+            return result;
+        }
+        try {
+            if (result instanceof android.content.pm.PackageInfo) {
+                scrub(((android.content.pm.PackageInfo) result).applicationInfo);
+            } else if (result instanceof ApplicationInfo) {
+                scrub((ApplicationInfo) result);
+            } else if (result instanceof java.util.List) {
+                for (Object o : (java.util.List<?>) result) {
+                    scrubItem(o);
+                }
+            } else if (result.getClass().getName().startsWith("android.content.pm.ParceledListSlice")) {
+                try {
+                    Object list = result.getClass().getMethod("getList").invoke(result);
+                    if (list instanceof java.util.List) {
+                        for (Object o : (java.util.List<?>) list) {
+                            scrubItem(o);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return result;
+    }
+
+    private static void scrubItem(Object o) {
+        if (o instanceof android.content.pm.PackageInfo) {
+            scrub(((android.content.pm.PackageInfo) o).applicationInfo);
+        } else if (o instanceof ApplicationInfo) {
+            scrub((ApplicationInfo) o);
+        }
+    }
+
+    /**
      * Rewrite the package name a guest Context reports. The container builds
      * the guest ContextImpl from the host process, so getPackageName() can
      * answer with the host package; integrity checks compare that against the
@@ -309,6 +468,10 @@ public final class OfxPatch {
             return;
         }
         try {
+            sanitizeEarly(base);
+        } catch (Throwable ignored) {
+        }
+        try {
             TmpApp tmp = new TmpApp();
             tmp.bind(base);
             black.android.app.BRActivityThread.get(
@@ -318,96 +481,6 @@ public final class OfxPatch {
                     + " base=" + base.getPackageName());
         } catch (Throwable t) {
             OfxLog.log("preBind failed " + t);
-        }
-    }
-
-    /**
-     * Ground truth about the Google packages the guest can actually see.
-     *
-     * The engine loads libFirebaseCppApp and stops. Firebase's first act is to
-     * ask the package manager whether Play services exist and what version they
-     * are; the container answers that question from the guest's package table,
-     * which may hold a real GMS, a fake vending entry with no sourceDir, or
-     * nothing at all. Guessing which of the three is in play has cost four
-     * builds - this prints it once, with the availability code Firebase itself
-     * would receive.
-     */
-    public static void probeGms(android.content.Context c) {
-        if (c == null) {
-            return;
-        }
-        try {
-            android.content.pm.PackageManager pm = c.getPackageManager();
-            probePkg(pm, "com.google.android.gms");
-            probePkg(pm, "com.google.android.vending");
-            probePkg(pm, "com.android.vending");
-            probePkg(pm, "com.google.android.gsf");
-            probePkg(pm, "com.google.android.gms.ads");
-            probePkg(pm, "com.catsbit.oxidesurvivalisland");
-        } catch (Throwable t) {
-            OfxLog.log("gms probe failed " + t);
-        }
-
-        try {
-            Class<?> gaa = null;
-            try {
-                gaa = Class.forName("com.google.android.gms.common.GoogleApiAvailability");
-            } catch (Throwable ignored) {
-            }
-            OfxLog.log("gms class=" + (gaa != null));
-            if (gaa != null) {
-                try {
-                    Object inst = gaa.getMethod("getInstance").invoke(null);
-                    String r = "?";
-                    try {
-                        r = String.valueOf(gaa
-                                .getMethod("isGooglePlayServicesAvailable",
-                                        android.content.Context.class)
-                                .invoke(inst, c));
-                    } catch (Throwable t1) {
-                        try {
-                            r = String.valueOf(gaa
-                                    .getMethod("isGooglePlayServicesAvailable",
-                                            android.content.Context.class, int.class)
-                                    .invoke(inst, c, 0));
-                        } catch (Throwable t2) {
-                            r = "err:" + t2.getClass().getSimpleName();
-                        }
-                    }
-                    OfxLog.log("gms available=" + r);
-                } catch (Throwable t) {
-                    OfxLog.log("gms available err=" + t);
-                }
-            }
-        } catch (Throwable ignored) {
-        }
-
-        try {
-            Class<?> fb = null;
-            try {
-                fb = Class.forName("com.google.firebase.FirebaseApp");
-            } catch (Throwable ignored) {
-            }
-            OfxLog.log("firebase class=" + (fb != null));
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void probePkg(android.content.pm.PackageManager pm, String pkg) {
-        try {
-            android.content.pm.PackageInfo pi = pm.getPackageInfo(pkg, 0);
-            String src = null;
-            String lib = null;
-            String data = null;
-            if (pi.applicationInfo != null) {
-                src = pi.applicationInfo.sourceDir;
-                lib = pi.applicationInfo.nativeLibraryDir;
-                data = pi.applicationInfo.dataDir;
-            }
-            OfxLog.log("pkg " + pkg + " v=" + pi.versionName + "/" + pi.versionCode
-                    + " src=" + src + " lib=" + lib + " data=" + data);
-        } catch (Throwable t) {
-            OfxLog.log("pkg " + pkg + " ERR " + t.getClass().getSimpleName());
         }
     }
 
@@ -454,37 +527,6 @@ public final class OfxPatch {
         } catch (Throwable t) {
             OfxLog.log("env failed " + t);
         }
-        if (probeEnabled()) {
-            try {
-                probeGms(app);
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    /**
-     * The v46 measurements are opt-in.
-     *
-     * v46 added the GMS probe, the thread probe and an asset hook, and the
-     * guest started dying 5 ms after Activity.onCreate at a fixed instruction
-     * inside libbinder_ndk - something v45 never did. Until the backtrace in
-     * the native handler names the caller, the default build keeps v45
-     * behaviour and the probe comes back by dropping
-     * /storage/emulated/0/Download/hardbox-probe.txt
-     */
-    private static Boolean sProbe = null;
-
-    public static boolean probeEnabled() {
-        if (sProbe != null) {
-            return sProbe.booleanValue();
-        }
-        boolean on = false;
-        try {
-            on = new java.io.File("/storage/emulated/0/Download/hardbox-probe.txt").exists();
-        } catch (Throwable ignored) {
-        }
-        sProbe = Boolean.valueOf(on);
-        return on;
     }
 
     /**

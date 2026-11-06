@@ -111,7 +111,13 @@ jobs:
                       "                top.niunaijun.blackbox.core.NativeCore.ofxSetGuestPackage(appConfig.packageName,\n"
                       "                        top.niunaijun.blackbox.util.OfxLog.logFd(),\n"
                       "                        top.niunaijun.blackbox.util.OfxLog.mode(),\n"
-                      "                        android.os.Process.myUid());\n"
+                      "                        appConfig.buid);\n"
+                      "            } catch (Throwable ignored) {\n"
+                      "            }\n"
+                      "            try {\n"
+                      "                top.niunaijun.blackbox.util.OfxLog.log(\"stealth uid=\" + appConfig.buid\n"
+                      "                        + \" myuid=\" + android.os.Process.myUid()\n"
+                      "                        + \" bpid=\" + appConfig.bpid);\n"
                       "            } catch (Throwable ignored) {\n"
                       "            }",
                       "initProcess stealth hook")
@@ -348,9 +354,11 @@ jobs:
               wr(p, s)
 
           # ---------- Application override for the protected guest ----------
+          # NOTE: keyed on the call, not the class name - the preBind patch
+          # above already mentions OfxPatch, which used to skip this block.
           p = "src/Bcore/src/main/java/top/niunaijun/blackbox/app/BActivityThread.java"
           s = rd(p)
-          if "OfxPatch" not in s:
+          if "OfxPatch.adjust" not in s:
               s = sub(s, "import top.niunaijun.blackbox.util.OfxLog;",
                       "import top.niunaijun.blackbox.util.OfxLog;\nimport top.niunaijun.blackbox.util.OfxPatch;",
                       "BActivityThread OfxPatch import")
@@ -726,6 +734,24 @@ jobs:
                       "        top.niunaijun.blackbox.util.OfxPatch.noteCall(method.getName(), args);\n"
                       "        MethodHook methodHook = mMethodHookMap.get(method.getName());",
                       "invoke observer")
+              wr(p, s)
+
+          # ---------- scrub container paths from every proxy result ----------
+          # PackageInfo / ApplicationInfo / installed lists all carry the
+          # virtual dataDir. One post-hook covers every service method instead
+          # of patching each getter separately.
+          p = "src/Bcore/src/main/java/top/niunaijun/blackbox/fake/hook/ClassInvocationStub.java"
+          s = rd(p)
+          if "OfxPatch.scrubResult" not in s:
+              s = sub(s,
+                      "        result = methodHook.hook(mBase, method, args);\n"
+                      "        result = methodHook.afterHook(result);\n"
+                      "        return result;",
+                      "        result = methodHook.hook(mBase, method, args);\n"
+                      "        result = methodHook.afterHook(result);\n"
+                      "        result = top.niunaijun.blackbox.util.OfxPatch.scrubResult(result);\n"
+                      "        return result;",
+                      "invoke scrubResult")
               wr(p, s)
 
           # ---------- activity_task: block the verdict's second act ----------

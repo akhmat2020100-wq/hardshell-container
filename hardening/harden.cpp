@@ -2445,10 +2445,17 @@ Java_top_niunaijun_blackbox_core_NativeCore_ofxSetGuestPackage(
     }
     env->ReleaseStringUTFChars(pkg, c);
 
+    {
+        char call[256];
+        snprintf(call, sizeof(call), "%s argUid=%d nativeUid=%d nativeEuid=%d",
+                 g_pkg, (int)uid, (int)getuid(), (int)geteuid());
+        nlogRaw("call", call);
+    }
+
     if (g_installed.exchange(true)) return;
 
     char head[256];
-    snprintf(head, sizeof(head), "v61 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
+    snprintf(head, sizeof(head), "v62 %s fd=%d mode=%d guestUid=%d realUid=%d realEuid=%d",
              g_pkg, g_logFd, g_mode, g_guestUid, (int)getuid(), (int)geteuid());
     nlogRaw("install", head);
 
